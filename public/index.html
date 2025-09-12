@@ -135,27 +135,48 @@
         if(!consent.checked){ alert('Please provide consent to proceed.'); return; }
         startBtn.disabled = true; endBtn.disabled = false;
 
-        // 1) PeerConnection with STUN + explicit recvonly transceiver (ensures remote audio track)
+        // === ONLY-CHANGED PART: ICE servers + a tiny "no-route" alert timer ===
         pc = new RTCPeerConnection({
           iceServers: [
-    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-    { urls: 'stun:global.stun.twilio.com:3478' } // no ?transport=udp
-  ]
+            // Solid public STUNs
+            { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+            { urls: 'stun:stun.cloudflare.com:3478' },
+            { urls: 'stun:global.stun.twilio.com:3478' },
+
+            // --- OPTIONAL TURN (uncomment and fill when you have creds) ---
+            // {
+            //   urls: 'turn:global.turn.twilio.com:3478?transport=udp',
+            //   username: '<TWILIO_USERNAME>',
+            //   credential: '<TWILIO_CREDENTIAL>'
+            // },
+            // {
+            //   urls: 'turn:global.turn.twilio.com:5349?transport=tcp', // TCP fallback for strict nets
+            //   username: '<TWILIO_USERNAME>',
+            //   credential: '<TWILIO_CREDENTIAL>'
+            // },
+          ]
         });
-        pc.addTransceiver('audio', { direction: 'recvonly' }); // <— important
+
+        pc.addTransceiver('audio', { direction: 'recvonly' });
 
         pc.onconnectionstatechange = () => log('pc state:', pc.connectionState);
         pc.oniceconnectionstatechange = () => log('ice state:', pc.iceConnectionState);
         pc.onicecandidateerror = e => log('ice error:', e.errorText || e);
 
-        // Data channel for greetings
+        // Data channel for greetings + “no-route” hint if it never opens
         dc = pc.createDataChannel('oai-events');
+        let dcOpenTimer = setTimeout(()=>{
+          if (!dc || dc.readyState !== 'open') {
+            alert("Network can't connect to the voice service (ICE). If this keeps happening on this Wi-Fi, enable TURN (uncomment in code and add credentials).");
+          }
+        }, 8000);
         dc.onopen = () => {
+          clearTimeout(dcOpenTimer);
           const greet = `Hai. Good ${timeOfDay()}. Which language would you like to talk in — English, తెలుగు (Telugu), or हिन्दी (Hindi)?`;
           try { dc.send(JSON.stringify({ type:'response.create', response:{ instructions:greet } })); } catch(e){ log('dc send err', e); }
         };
 
-        // 2) Mic
+        // Mic
         try{
           localStream = await navigator.mediaDevices.getUserMedia({
             audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
@@ -166,7 +187,7 @@
         }
         localStream.getTracks().forEach(t=>pc.addTrack(t, localStream));
 
-        // 3) Remote audio + recorder + simple VAD
+        // Remote audio + recorder + simple VAD
         pc.ontrack = (ev)=>{
           log('remote track');
           remoteStream = ev.streams[0];
@@ -176,6 +197,7 @@
 
           const ctx = new (window.AudioContext||window.webkitAudioContext)();
           const dest = ctx.createMediaStreamDestination();
+          ctx.resume && ctx.resume().catch(()=>{}); // nudge on iOS/Safari
 
           const micSrc = ctx.createMediaStreamSource(localStream);
           const aiSrc  = ctx.createMediaStreamSource(remoteStream);
@@ -209,7 +231,7 @@
           mediaRecorder.start(250);
         };
 
-        // 4) Create offer and wait for ICE gathering (or 2s timeout)
+        // Offer + ICE gather (2s max)
         const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
         await new Promise(resolve=>{
           if(pc.iceGatheringState==='complete') return resolve();
@@ -217,7 +239,7 @@
           pc.onicegatheringstatechange=()=>{ if(pc.iceGatheringState==='complete'){ clearTimeout(to); resolve(); } };
         });
 
-        // 5) Fetch ephemeral **now** (right before POST), then POST SDP, retry once on 401/403
+        // Ephemeral + SDP post (with one refresh retry)
         const sess = await getEphemeral();
         let token = sess.client_secret?.value;
         const model = sess.model || 'gpt-4o-realtime-preview';
