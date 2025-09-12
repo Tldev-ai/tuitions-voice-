@@ -16,11 +16,10 @@ app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
 
-// ---- Multer for uploads ----
 const upload = multer({ limits: { fileSize: 50 * 1024 * 1024 } });
 
 // ========================
-// Google Drive client (optional)
+// Google Drive (optional)
 // ========================
 let drive = null;
 let DRIVE_OK = false;
@@ -29,7 +28,6 @@ try {
   if (saRaw) {
     const sa = JSON.parse(saRaw);
     if (sa.private_key?.includes('\\n')) sa.private_key = sa.private_key.replace(/\\n/g, '\n');
-
     const auth = new google.auth.GoogleAuth({
       credentials: sa,
       scopes: ['https://www.googleapis.com/auth/drive.file'],
@@ -45,12 +43,8 @@ try {
 }
 
 // ========================
-// Realtime session (WebRTC)
+// OpenAI Realtime (WebRTC)
 // ========================
-//
-// Client calls this to mint an ephemeral key for the WebRTC connection.
-// Your client then POSTs its SDP to: https://api.openai.com/v1/realtime?model=...
-//
 async function createRealtimeSession() {
   const model = process.env.REALTIME_MODEL || 'gpt-4o-realtime-preview';
   const voice = process.env.REALTIME_VOICE || 'verse';
@@ -60,13 +54,12 @@ async function createRealtimeSession() {
     headers: {
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       'Content-Type': 'application/json',
-      // IMPORTANT: enable Realtime
+      // REQUIRED for Realtime
       'OpenAI-Beta': 'realtime=v1',
     },
     body: JSON.stringify({
       model,
       voice,
-      // You can set defaults here; client can still send session.update
       turn_detection: { type: 'server_vad', silence_duration_ms: 500 },
       instructions: `
 You are "iiTuitions Admissions Assistant". Speak warmly and clearly.
@@ -103,17 +96,17 @@ FINISH:
   return data;
 }
 
-// Support both /session and /api/session (your HTML uses /api/session)
+// Support both /session and /api/session (client uses /api/session)
 app.get(['/session', '/api/session'], async (_req, res) => {
   try {
     if (!process.env.OPENAI_API_KEY) {
       return res.status(500).json({ error: { message: 'OPENAI_API_KEY is not set' } });
     }
     const data = await createRealtimeSession();
-    return res.json(data);
+    res.json(data);
   } catch (e) {
     console.error('Failed to create realtime session:', e?.message || e);
-    return res.status(500).json({ error: { message: String(e?.message || e) } });
+    res.status(500).json({ error: { message: String(e?.message || e) } });
   }
 });
 
@@ -126,7 +119,7 @@ async function handleUpload(req, res) {
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
 
     if (!DRIVE_OK || !drive) {
-      // Don’t 404; return a friendly no-op so your UI doesn’t show errors
+      // No-op, but don't error—avoids 404 noise in client
       return res.status(200).json({
         uploaded: false,
         reason: 'google_drive_not_configured',
@@ -134,7 +127,7 @@ async function handleUpload(req, res) {
       });
     }
 
-    // 1) Audio
+    // Audio
     let audioId = null, audioLink = null;
     if (req.file) {
       const audioResp = await drive.files.create({
@@ -149,7 +142,7 @@ async function handleUpload(req, res) {
       audioLink = audioResp.data.webViewLink;
     }
 
-    // 2) Transcript JSON
+    // Transcript JSON
     const tResp = await drive.files.create({
       requestBody: {
         name: `iituitions-voice-${ts}.json`,
@@ -159,7 +152,7 @@ async function handleUpload(req, res) {
       fields: 'id, webViewLink',
     });
 
-    return res.json({
+    res.json({
       uploaded: true,
       audioFileId: audioId,
       audioLink,
@@ -169,14 +162,14 @@ async function handleUpload(req, res) {
   } catch (e) {
     const details = e?.response?.data || e?.errors || e?.message || e;
     console.error('DRIVE UPLOAD ERROR →', details);
-    return res.status(500).json({ error: 'Drive upload failed', details: String(details) });
+    res.status(500).json({ error: 'Drive upload failed', details: String(details) });
   }
 }
 
-// Expose both endpoints so your HTML (`/api/upload`) doesn’t 404
+// expose both paths so client `/api/upload` works
 app.post(['/upload', '/api/upload'], upload.single('audio'), handleUpload);
 
-// Health check
+// health
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
