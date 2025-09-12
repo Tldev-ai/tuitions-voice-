@@ -155,7 +155,7 @@
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
       startBtn.disabled = true; endBtn.disabled = false;
 
-      const resp = await fetch('/session');
+      const resp = await fetch('/api/session');
       if (!resp.ok) {
         const err = await resp.json().catch(()=>({}));
         alert('Failed to create realtime session' + (err?.error?.message ? (':\n' + err.error.message) : ''));
@@ -251,7 +251,7 @@
       form.append('audio', audioBlob, 'conversation.webm');
       form.append('transcriptJson', JSON.stringify({ endedAt: new Date().toISOString() }));
 
-      try { await fetch('/upload', { method: 'POST', body: form }); } catch {}
+      try { await fetch('/api/upload', { method: 'POST', body: form }); } catch {}
       startBtn.disabled = false; recordedChunks = [];
     }
 
