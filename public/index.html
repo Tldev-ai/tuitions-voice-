@@ -44,24 +44,6 @@
       <p class="sub muted">Get answers in <b>2–3 minutes</b>. Available in <b>English / తెలుగు / हिन्दी</b>.</p>
       <p>Click below to speak. Your conversation is recorded (audio + summary) for follow-up.</p>
 
-      <div class="section-title">I can help with</div>
-      <ul>
-        <li>Course options, fees, and current batches</li>
-        <li>Home tutoring vs. online classes</li>
-        <li>Board/grade &amp; subject guidance</li>
-        <li>Demo class and timings</li>
-        <li>Scholarships / discounts (if available)</li>
-      </ul>
-
-      <div class="section-title">Keep these handy</div>
-      <ul>
-        <li>Student name &amp; grade/board</li>
-        <li>Subjects needed</li>
-        <li>Location or <b>Online</b> preference</li>
-        <li>Preferred time to call back</li>
-        <li>Budget range (optional)</li>
-      </ul>
-
       <label class="consent">
         <input type="checkbox" id="consent" />
         I agree to the recording and storage of this conversation.
@@ -74,20 +56,7 @@
         <audio id="aiAudio" autoplay playsinline></audio>
       </div>
 
-      <div class="fine">Tip: say <b>“Switch to Telugu”</b> or <b>“Switch to Hindi”</b> anytime.</div>
-
       <div class="divider"></div>
-
-      <div class="section-title">What happens after this call</div>
-      <ol>
-        <li>You’ll get a short <b>summary</b> of the call.</li>
-        <li>Our counselor will reach out within <b>one working day</b>.</li>
-        <li>If you want a demo, we’ll schedule it for your preferred time.</li>
-      </ol>
-
-      <p class="footer-note"><b>Privacy:</b> We record this call (audio + summary) only for admission support and store it securely in our institute’s Google Drive. We never share your data outside iiTuitions.
-        <span class="right">Prefer a person? Call <b>+91-XXXXXXXXXX</b></span>
-      </p>
 
       <pre id="log" style="display:none"></pre>
     </section>
@@ -113,7 +82,6 @@
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
       startBtn.disabled = true; endBtn.disabled = false;
 
-      // 1) ephemeral session from your server
       const resp = await fetch('/api/session');
       if (!resp.ok) {
         const err = await resp.json().catch(()=>({}));
@@ -124,23 +92,27 @@
       const EPHEMERAL = sess?.client_secret?.value;
       const MODEL = encodeURIComponent(sess?.model || 'gpt-4o-realtime-preview');
 
-      // 2) AudioContext (resume on user gesture)
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       if (ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
 
-      // 3) PeerConnection (uncomment relay line if your Wi-Fi blocks SRTP)
+      // ---- TURN (add your provider creds below) ----
+      const iceServers = [
+        { urls: ['stun:stun.l.google.com:19302'] },
+        // { urls: 'turn:YOUR_TURN_HOST:3478?transport=udp', username: 'USER', credential: 'PASS' },
+        // { urls: 'turns:YOUR_TURN_HOST:5349?transport=tcp', username: 'USER', credential: 'PASS' },
+      ];
+
       pc = new RTCPeerConnection({
-        iceServers: [
-          { urls: ['stun:stun.l.google.com:19302'] },
-          // Add your TURN for production:
-          // { urls: 'turn:YOUR_TURN_HOST:3478', username: 'USER', credential: 'PASS' }
-        ],
-        // iceTransportPolicy: 'relay', // ← enable if needed on strict networks
+        iceServers,
+        // If your network is strict, UNCOMMENT to force using TURN:
+        // iceTransportPolicy: 'relay',
       });
+
+      window.pc = pc; // for devtools
       pc.oniceconnectionstatechange = () => log('ice:', pc.iceConnectionState);
       pc.onconnectionstatechange   = () => log('pc:', pc.connectionState);
 
-      // === ONE bidirectional audio m-line ===
+      // Single bidirectional m-line
       const tx = pc.addTransceiver('audio', { direction: 'sendrecv' });
       try {
         const caps = RTCRtpReceiver.getCapabilities('audio');
@@ -148,7 +120,7 @@
         if (opusOnly.length) tx.setCodecPreferences(opusOnly);
       } catch {}
 
-      // 4) DataChannel
+      // DataChannel
       dc = pc.createDataChannel('oai-events');
       dc.onmessage = (e) => {
         try {
@@ -160,11 +132,8 @@
       dc.onopen = () => {
         dc.send(JSON.stringify({
           type: 'session.update',
-          session: {
-            modalities: ['audio','text'],
-            voice: 'verse',
-            turn_detection: { type: 'server_vad', silence_duration_ms: 500 }
-          }
+          session: { modalities: ['audio','text'], voice: 'verse',
+            turn_detection: { type: 'server_vad', silence_duration_ms: 500 } }
         }));
         dc.send(JSON.stringify({
           type: 'response.create',
@@ -172,21 +141,21 @@
         }));
       };
 
-      // 5) Mic → attach to THIS transceiver (no addTrack)
+      // Mic -> THIS transceiver
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
         });
       } catch {
-        alert('Microphone blocked. Click the mic icon in the address bar and Allow, then reload.');
+        alert('Microphone blocked. Click Allow, then reload.');
         startBtn.disabled=false; endBtn.disabled=true; return;
       }
       tx.sender.replaceTrack(localStream.getAudioTracks()[0]);
 
-      // 6) Remote audio
+      // Remote audio + recording
       const dest = ctx.createMediaStreamDestination();
       pc.ontrack = (ev) => {
-        log('ontrack audio muted=', ev.track.muted);
+        log('ontrack', ev.track.kind, 'muted=', ev.track.muted);
         remoteStream = ev.streams?.[0] || new MediaStream([ev.track]);
         aiAudio.srcObject = remoteStream;
         aiAudio.muted = false;
@@ -194,7 +163,6 @@
         aiAudio.play().catch(()=>{});
         ev.track.onunmute = () => log('remote track unmuted (audio flowing)');
 
-        // Recorder (mix mic + ai)
         const micSrc = ctx.createMediaStreamSource(localStream);
         const aiSrc  = ctx.createMediaStreamSource(remoteStream);
         micSrc.connect(dest); aiSrc.connect(dest);
@@ -228,13 +196,10 @@
         mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
         mediaRecorder.start(250);
 
-        // one-line voice check to confirm audio path
-        try {
-          dc?.send(JSON.stringify({ type:'response.create', response:{ modalities:['audio'], instructions:'Voice check okay.' } }));
-        } catch {}
+        // One-line voice check
+        try { dc?.send(JSON.stringify({ type:'response.create', response:{ modalities:['audio'], instructions:'Voice check okay.' } })); } catch {}
       };
 
-      // 7) SDP offer/answer with OpenAI
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       await new Promise((resolve) => {
@@ -252,15 +217,11 @@
         },
         body: pc.localDescription.sdp
       });
-
       if (!sdpResp.ok) {
-        const t = await sdpResp.text();
-        console.error('Realtime SDP error:', t);
-        alert('Realtime connection failed. Check model/quota or ephemeral key.');
-        endCall();
-        return;
+        console.error('Realtime SDP error:', await sdpResp.text());
+        alert('Realtime connection failed.');
+        endCall(); return;
       }
-
       const answer = { type: 'answer', sdp: await sdpResp.text() };
       await pc.setRemoteDescription(answer);
     }
