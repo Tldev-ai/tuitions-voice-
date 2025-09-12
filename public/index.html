@@ -106,7 +106,6 @@
 
     const SILENCE_MS = 15000;
     const RMS_THRESHOLD = 0.006;
-
     const log = (...a)=>console.log(...a);
 
     function timeOfDay(){ const h=new Date().getHours(); return h<12?'morning':h<17?'afternoon':h<21?'evening':'night'; }
@@ -130,15 +129,23 @@
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       if (ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
 
-      // 3) PeerConnection; explicitly request to RECEIVE audio
+      // 3) PeerConnection; (flip to 'relay' if your Wi-Fi blocks SRTP)
       pc = new RTCPeerConnection({
         iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
-        // If behind strict NAT/firewall uncomment:
-        // iceTransportPolicy: 'relay'
+        // iceTransportPolicy: 'relay', // ← uncomment if network is strict/NATed
       });
-      pc.addTransceiver('audio', { direction: 'sendrecv' }); // must be before createOffer
       pc.oniceconnectionstatechange = () => log('ice:', pc.iceConnectionState);
       pc.onconnectionstatechange   = () => log('pc:', pc.connectionState);
+
+      // === ONE bidirectional audio m-line via transceiver ===
+      const tx = pc.addTransceiver('audio', { direction: 'sendrecv' });
+
+      // Force OPUS so negotiation is predictable
+      try {
+        const caps = RTCRtpReceiver.getCapabilities('audio');
+        const opusOnly = caps.codecs.filter(c => c.mimeType.toLowerCase() === 'audio/opus');
+        if (opusOnly.length) tx.setCodecPreferences(opusOnly);
+      } catch (e) { /* some browsers may not expose caps */ }
 
       // 4) Data channel for session control/events
       dc = pc.createDataChannel('oai-events');
@@ -149,7 +156,6 @@
           else log('OAI:', msg?.type || msg);
         } catch { log('OAI raw:', e.data); }
       };
-
       dc.onopen = () => {
         // Configure the session to speak
         dc.send(JSON.stringify({
@@ -167,7 +173,7 @@
         }));
       };
 
-      // 5) Get microphone and publish
+      // 5) Get microphone and attach to THIS transceiver (no addTrack)
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
@@ -176,27 +182,27 @@
         alert('Microphone blocked. Click the mic icon in the address bar and Allow, then reload.');
         startBtn.disabled=false; endBtn.disabled=true; return;
       }
-      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+      tx.sender.replaceTrack(localStream.getAudioTracks()[0]);  // ← key change
 
-      // 6) Remote audio handling (robust to empty streams array)
+      // 6) Remote audio handling (robust; force playback)
       const dest = ctx.createMediaStreamDestination();
       pc.ontrack = (ev) => {
-        log('ontrack fired');
+        log('ontrack', ev.track.kind, 'muted=', ev.track.muted);
         const track = ev.track;
-        if (!remoteStream) {
-          remoteStream = ev.streams?.[0] || new MediaStream();
-          if (!ev.streams?.length) remoteStream.addTrack(track);
-        }
+        if (!remoteStream) remoteStream = ev.streams?.[0] || new MediaStream();
+        if (ev.streams?.length === 0) remoteStream.addTrack(track);
+
         aiAudio.srcObject = remoteStream;
         aiAudio.muted = false;
-        aiAudio.play().catch(()=>{ /* iOS may need extra resume, but we already did */ });
+        aiAudio.setSinkId?.('default').catch(()=>{});
+        aiAudio.play().catch(()=>{}); // ensure playback post-click
 
         // Mix mic+AI into recorder
         const micSrc = ctx.createMediaStreamSource(localStream);
         const aiSrc  = ctx.createMediaStreamSource(remoteStream);
         micSrc.connect(dest); aiSrc.connect(dest);
 
-        // LED + silence from mic
+        // LED + silence monitor (from mic)
         analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
         const micTap = ctx.createMediaStreamSource(localStream);
         micTap.connect(analyser);
@@ -228,7 +234,7 @@
         mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
         mediaRecorder.start(250);
 
-        // Force a one-line voice check (useful for confirming audio path)
+        // One-line voice check
         try {
           dc?.send(JSON.stringify({ type:'response.create', response:{ modalities:['audio'], instructions:'Voice check okay.' } }));
         } catch {}
