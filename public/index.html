@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>iiTuitions — Voice</title>
+  <title>iiTuitions — Voice (HTTPS mode)</title>
   <style>
     :root{ --ink:#000; --ring:#e5e7eb; --idle:#bbb; }
     *{box-sizing:border-box}
@@ -23,14 +23,9 @@
     #startBtn{min-width:320px;padding:14px 36px;font-size:18px}
     button.end{background:#000;color:#fff;border:2px solid #000} button:disabled{opacity:.6;cursor:not-allowed}
     .fine{font-size:12px;margin-top:8px}
-    audio{display:none}
     .led{width:10px;height:10px;border-radius:999px;background:var(--idle);box-shadow:0 0 0 1px #0001}
     .led.on{background:#000}
-    ul,ol{margin:8px 0 14px 20px} li{margin:4px 0}
-    .section-title{font-weight:800;margin-top:10px}
-    .divider{height:1px;background:#eee;margin:14px 0;border-radius:1px}
-    .footer-note{font-size:13px;margin-top:2px}
-    .right{float:right} @media (max-width:640px){.right{float:none;display:block;margin-top:6px}}
+    audio{display:none}
   </style>
 </head>
 <body>
@@ -41,8 +36,7 @@
   <main class="wrap">
     <section class="card">
       <h1>Talk to our Admissions Assistant</h1>
-      <p class="sub muted">Get answers in <b>2–3 minutes</b>. Available in <b>English / తెలుగు / हिन्दी</b>.</p>
-      <p>Click below to speak. Your conversation is recorded (audio + summary) for follow-up.</p>
+      <p class="sub muted">Works behind any firewall — no WebRTC.</p>
 
       <label class="consent">
         <input type="checkbox" id="consent" />
@@ -56,197 +50,145 @@
         <audio id="aiAudio" autoplay playsinline></audio>
       </div>
 
-      <div class="divider"></div>
-
-      <pre id="log" style="display:none"></pre>
+      <p class="fine">Say “Switch to Telugu” or “Switch to Hindi” anytime.</p>
     </section>
   </main>
 
   <script>
+    // ====== Simple voice bot over HTTPS (no WebRTC) ======
+    const consent = document.getElementById('consent');
     const startBtn = document.getElementById('startBtn');
-    const endBtn   = document.getElementById('endBtn');
-    const aiAudio  = document.getElementById('aiAudio');
-    const consent  = document.getElementById('consent');
-    const led      = document.getElementById('led');
+    const endBtn = document.getElementById('endBtn');
+    const led = document.getElementById('led');
+    const aiAudio = document.getElementById('aiAudio');
 
-    let pc, dc, localStream, remoteStream, mediaRecorder, recordedChunks = [];
-    let silenceRAF, silenceTimer, analyser, dataArray;
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let recog, recTimer;
+    let running = false;
+    let lang = 'en';              // 'en' | 'hi' | 'te'
+    let langToBCP47 = { en: 'en-IN', hi: 'hi-IN', te: 'te-IN' };
+    let history = [];
 
-    const SILENCE_MS = 15000;
-    const RMS_THRESHOLD = 0.006;
-    const log = (...a)=>console.log(...a);
+    function timeOfDay(){ const h=new Date().getHours(); return h<12?'morning':h<17?'afternoon':'evening'; }
 
-    function timeOfDay(){ const h=new Date().getHours(); return h<12?'morning':h<17?'afternoon':h<21?'evening':'night'; }
-
-    async function startCall() {
-      if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
-      startBtn.disabled = true; endBtn.disabled = false;
-
-      const resp = await fetch('/api/session');
-      if (!resp.ok) {
-        const err = await resp.json().catch(()=>({}));
-        alert('Failed to create realtime session' + (err?.error?.message ? (':\n' + err.error.message) : ''));
-        startBtn.disabled=false; endBtn.disabled=true; return;
-      }
-      const sess = await resp.json();
-      const EPHEMERAL = sess?.client_secret?.value;
-      const MODEL = encodeURIComponent(sess?.model || 'gpt-4o-realtime-preview');
-
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      if (ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
-
-      // ---- TURN (add your provider creds below) ----
-      const iceServers = [
-        { urls: ['stun:stun.l.google.com:19302'] },
-        // { urls: 'turn:YOUR_TURN_HOST:3478?transport=udp', username: 'USER', credential: 'PASS' },
-        // { urls: 'turns:YOUR_TURN_HOST:5349?transport=tcp', username: 'USER', credential: 'PASS' },
-      ];
-
-      pc = new RTCPeerConnection({
-        iceServers,
-        // If your network is strict, UNCOMMENT to force using TURN:
-        // iceTransportPolicy: 'relay',
-      });
-
-      window.pc = pc; // for devtools
-      pc.oniceconnectionstatechange = () => log('ice:', pc.iceConnectionState);
-      pc.onconnectionstatechange   = () => log('pc:', pc.connectionState);
-
-      // Single bidirectional m-line
-      const tx = pc.addTransceiver('audio', { direction: 'sendrecv' });
-      try {
-        const caps = RTCRtpReceiver.getCapabilities('audio');
-        const opusOnly = caps.codecs.filter(c => c.mimeType.toLowerCase() === 'audio/opus');
-        if (opusOnly.length) tx.setCodecPreferences(opusOnly);
-      } catch {}
-
-      // DataChannel
-      dc = pc.createDataChannel('oai-events');
-      dc.onmessage = (e) => {
+    function speakLocal(text, bcp47){
+      return new Promise(async (resolve) => {
+        // Prefer native speech synthesis
+        if ('speechSynthesis' in window) {
+          const u = new SpeechSynthesisUtterance(text);
+          u.lang = bcp47 || 'en-IN';
+          u.rate = 1; u.pitch = 1;
+          u.onend = resolve;
+          speechSynthesis.speak(u);
+          return;
+        }
+        // Fallback to server TTS (MP3)
         try {
-          const msg = JSON.parse(e.data);
-          if (msg?.type?.includes?.('error') || msg?.level === 'error') console.error('OAI error:', msg);
-          else log('OAI:', msg?.type || msg);
-        } catch { log('OAI raw:', e.data); }
-      };
-      dc.onopen = () => {
-        dc.send(JSON.stringify({
-          type: 'session.update',
-          session: { modalities: ['audio','text'], voice: 'verse',
-            turn_detection: { type: 'server_vad', silence_duration_ms: 500 } }
-        }));
-        dc.send(JSON.stringify({
-          type: 'response.create',
-          response: { modalities: ['audio'], instructions: `Hi! Good ${timeOfDay()}. Which language would you like to talk in — English, Telugu, or Hindi?` }
-        }));
-      };
-
-      // Mic -> THIS transceiver
-      try {
-        localStream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
-        });
-      } catch {
-        alert('Microphone blocked. Click Allow, then reload.');
-        startBtn.disabled=false; endBtn.disabled=true; return;
-      }
-      tx.sender.replaceTrack(localStream.getAudioTracks()[0]);
-
-      // Remote audio + recording
-      const dest = ctx.createMediaStreamDestination();
-      pc.ontrack = (ev) => {
-        log('ontrack', ev.track.kind, 'muted=', ev.track.muted);
-        remoteStream = ev.streams?.[0] || new MediaStream([ev.track]);
-        aiAudio.srcObject = remoteStream;
-        aiAudio.muted = false;
-        aiAudio.setSinkId?.('default').catch(()=>{});
-        aiAudio.play().catch(()=>{});
-        ev.track.onunmute = () => log('remote track unmuted (audio flowing)');
-
-        const micSrc = ctx.createMediaStreamSource(localStream);
-        const aiSrc  = ctx.createMediaStreamSource(remoteStream);
-        micSrc.connect(dest); aiSrc.connect(dest);
-
-        analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
-        const micTap = ctx.createMediaStreamSource(localStream);
-        micTap.connect(analyser);
-        dataArray = new Float32Array(analyser.fftSize);
-
-        const resetSilence = () => {
-          if (silenceTimer) clearTimeout(silenceTimer);
-          silenceTimer = setTimeout(() => {
-            try {
-              dc?.send(JSON.stringify({ type:'response.create', response:{ modalities:['audio'], instructions:"Sorry, I'm unable to hear you. I'll end this call now." } }));
-            } catch {}
-            setTimeout(endCall, 1800);
-          }, SILENCE_MS);
-        };
-        const monitor = () => {
-          analyser.getFloatTimeDomainData(dataArray);
-          let rms = 0; for (let i=0;i<dataArray.length;i++){ const v=dataArray[i]; rms += v*v; }
-          rms = Math.sqrt(rms / dataArray.length);
-          if (rms > RMS_THRESHOLD) { led.classList.add('on'); resetSilence(); }
-          else { led.classList.remove('on'); }
-          silenceRAF = requestAnimationFrame(monitor);
-        };
-        setTimeout(()=>{ resetSilence(); monitor(); }, 1200);
-
-        try { mediaRecorder = new MediaRecorder(dest.stream, { mimeType: 'audio/webm;codecs=opus' }); }
-        catch { mediaRecorder = new MediaRecorder(dest.stream); }
-        mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
-        mediaRecorder.start(250);
-
-        // One-line voice check
-        try { dc?.send(JSON.stringify({ type:'response.create', response:{ modalities:['audio'], instructions:'Voice check okay.' } })); } catch {}
-      };
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      await new Promise((resolve) => {
-        if (pc.iceGatheringState === 'complete') return resolve();
-        pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') resolve(); };
-        setTimeout(resolve, 1500);
+          const r = await fetch('/api/tts', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ text, voice: 'verse' })
+          });
+          const blob = await r.blob();
+          aiAudio.src = URL.createObjectURL(blob);
+          aiAudio.onended = resolve;
+          aiAudio.play().catch(()=>resolve());
+        } catch { resolve(); }
       });
+    }
 
-      const sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${MODEL}`, {
+    function detectSwitch(text){
+      const t = text.toLowerCase();
+      if (t.includes('switch to telugu') || t.includes('telugu')) return 'te';
+      if (t.includes('switch to hindi')  || t.includes('hindi'))  return 'hi';
+      if (t.includes('switch to english')|| t.includes('english'))return 'en';
+      return null;
+    }
+
+    function startRecog(){
+      if (!SR) { alert('Your browser lacks SpeechRecognition. Use Chrome desktop or provide TTS only.'); return; }
+      if (recog) { try{ recog.abort(); }catch{} }
+      recog = new SR();
+      recog.lang = langToBCP47[lang] || 'en-IN';
+      recog.interimResults = false;
+      recog.continuous = false;
+
+      recog.onstart = () => { led.classList.add('on'); kickSilenceTimer(); };
+      recog.onend = () => { led.classList.remove('on'); if (running) kickSilenceTimer(true); };
+      recog.onerror = () => { led.classList.remove('on'); if (running) kickSilenceTimer(true); };
+
+      recog.onresult = async (e) => {
+        clearTimeout(recTimer);
+        const spoken = (e.results[0] && e.results[0][0] && e.results[0][0].transcript) || '';
+        // language switch?
+        const sw = detectSwitch(spoken);
+        if (sw && sw !== lang) {
+          lang = sw;
+          await speakLocal(lang==='en' ? 'Okay, I will continue in English.'
+              : lang==='hi' ? 'ठीक है, मैं अब हिन्दी में बात करूंगा।'
+              : 'సరే, ఇప్పటి నుంచి తెలుగు లో మాట్లాడుతాను.', langToBCP47[lang]);
+        } else {
+          await sendToChat(spoken);
+        }
+        if (running) startRecog();
+      };
+
+      recog.start();
+    }
+
+    async function sendToChat(userText){
+      history.push({ role:'user', content:userText });
+      // call server
+      const r = await fetch('/api/chat', {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${EPHEMERAL}`,
-          'Content-Type': 'application/sdp',
-          'OpenAI-Beta': 'realtime=v1'
-        },
-        body: pc.localDescription.sdp
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ history, lang })
       });
-      if (!sdpResp.ok) {
-        console.error('Realtime SDP error:', await sdpResp.text());
-        alert('Realtime connection failed.');
-        endCall(); return;
-      }
-      const answer = { type: 'answer', sdp: await sdpResp.text() };
-      await pc.setRemoteDescription(answer);
+      const j = await r.json();
+      const bot = j.text || '…';
+      history.push({ role:'assistant', content:bot });
+      await speakLocal(bot, langToBCP47[lang]);
     }
 
-    async function endCall() {
-      endBtn.disabled = true;
-      try { if (silenceTimer) clearTimeout(silenceTimer); if (silenceRAF) cancelAnimationFrame(silenceRAF); } catch {}
-      try { mediaRecorder && mediaRecorder.stop(); } catch {}
-      try { pc && pc.close(); } catch {}
-      try { localStream && localStream.getTracks().forEach(t => t.stop()); } catch {}
-
-      if (recordedChunks.length) {
-        const audioBlob = new Blob(recordedChunks, { type: 'audio/webm' });
-        const form = new FormData();
-        form.append('audio', audioBlob, 'conversation.webm');
-        form.append('transcriptJson', JSON.stringify({ endedAt: new Date().toISOString() }));
-        try { await fetch('/api/upload', { method: 'POST', body: form }); } catch {}
-      }
-
-      startBtn.disabled = false; recordedChunks = [];
+    function kickSilenceTimer(restart=false){
+      clearTimeout(recTimer);
+      recTimer = setTimeout(async () => {
+        if (!running) return;
+        await speakLocal(
+          lang==='en' ? "Sorry, I can't hear you. I'll end this call now."
+          : lang==='hi' ? "माफ़ कीजिए, आपकी आवाज़ नहीं आ रही है। अब मैं कॉल समाप्त कर रहा हूँ।"
+          : "క్షమించండి, నేను వినలేకపోతున్నాను. ఇప్పుడు కాల్ ముగిస్తున్నాను.",
+          langToBCP47[lang]
+        );
+        stopAll();
+      }, 10000);
+      if (restart && SR) setTimeout(()=>recog && recog.start(), 150); // auto-retry
     }
 
-    startBtn.addEventListener('click', startCall);
-    endBtn.addEventListener('click', endCall);
-    window.addEventListener('beforeunload', () => { try { pc && pc.close(); } catch {} });
+    async function startAll(){
+      if (!consent.checked) { alert('Please agree to the recording notice.'); return; }
+      running = true; startBtn.disabled = true; endBtn.disabled = false;
+
+      // greeting
+      await speakLocal(
+        lang==='en' ? `Hai. Good ${timeOfDay()}. Which language would you like to talk in — English, Telugu, or Hindi?`
+        : lang==='hi' ? `हाय। शुभ ${timeOfDay()==='morning'?'सुबह':'शाम'}. आप किस भाषा में बात करना चाहेंगे — English, हिंदी या तेलुगु?`
+        : `హాయ్. శుభ ${timeOfDay()==='morning'?'ఉదయం':'సాయంత్రం'}. మీరు ఏ భాషలో మాట్లాడాలనుకుంటున్నారు — ఇంగ్లీష్, తెలుగు లేదా హిందీ?`,
+        langToBCP47[lang]
+      );
+
+      startRecog();
+    }
+
+    function stopAll(){
+      running = false; startBtn.disabled = false; endBtn.disabled = true;
+      try { clearTimeout(recTimer); } catch {}
+      try { recog && recog.abort(); } catch {}
+      led.classList.remove('on');
+    }
+
+    startBtn.addEventListener('click', startAll);
+    endBtn.addEventListener('click', stopAll);
   </script>
 </body>
 </html>
