@@ -75,6 +75,7 @@
 </head>
 <body>
   <header class="top">
+    <!-- Make sure this file exists at /public/assets/iituitions-logo.png -->
     <a class="brand" href="#"><img src="/assets/iituitions-logo.png" alt="logo" style="height:24px"> iiTuitions</a>
   </header>
 
@@ -130,12 +131,12 @@
         <span class="right">Prefer a person? Call <b>+91-XXXXXXXXXX</b></span>
       </p>
 
-      <!-- hidden log (unchanged functionality) -->
+      <!-- hidden log (optional) -->
       <pre id="log" style="display:none"></pre>
     </section>
   </main>
 
-  <!-- ===== Voice logic (unchanged) ===== -->
+  <!-- ===== Voice logic ===== -->
   <script>
     const startBtn = document.getElementById('startBtn');
     const endBtn   = document.getElementById('endBtn');
@@ -151,20 +152,20 @@
 
     function timeOfDay(){ const h=new Date().getHours(); return h<12?'morning':h<17?'afternoon':h<21?'evening':'night'; }
 
+    function diag(...a){ try{ console.log('[voice]', ...a); }catch{} }
+
+    async function getEphemeral() {
+      const r = await fetch('/api/session');
+      if (!r.ok) throw new Error('Session failed: ' + (await r.text()));
+      const j = await r.json();
+      return { token: j.client_secret.value, model: j.model || 'gpt-4o-realtime-preview' };
+    }
+
     async function startCall() {
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
       startBtn.disabled = true; endBtn.disabled = false;
 
-      const resp = await fetch('/api/session');
-      if (!resp.ok) {
-        const err = await resp.json().catch(()=>({}));
-        alert('Failed to create realtime session' + (err?.error?.message ? (':\n' + err.error.message) : ''));
-        startBtn.disabled=false; endBtn.disabled=true; return;
-      }
-      const sess = await resp.json();
-      const EPHEMERAL = sess.client_secret.value;
-      const MODEL = encodeURIComponent(sess.model || 'gpt-4o-realtime-preview');
-
+      // 1) Prepare WebRTC first (no session fetch yet)
       pc = new RTCPeerConnection();
       dc = pc.createDataChannel('oai-events');
 
@@ -182,6 +183,9 @@
         startBtn.disabled=false; endBtn.disabled=true; return;
       }
       localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+      pc.onconnectionstatechange = () => diag('pc state:', pc.connectionState);
+      pc.oniceconnectionstatechange = () => diag('ice state:', pc.iceConnectionState);
 
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       const dest = ctx.createMediaStreamDestination();
@@ -225,16 +229,37 @@
         mediaRecorder.start(250);
       };
 
+      // 2) Create offer and finish ICE gathering
       const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
       await new Promise((resolve) => {
         if (pc.iceGatheringState === 'complete') return resolve();
         pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') resolve(); };
       });
-      const sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${MODEL}`, {
+
+      // 3) Fetch ephemeral token RIGHT BEFORE posting SDP; retry once on 401
+      let { token: EPHEMERAL, model: MODEL } = await getEphemeral();
+      let sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${EPHEMERAL}`, 'Content-Type': 'application/sdp' },
         body: pc.localDescription.sdp
       });
+
+      if (!sdpResp.ok) {
+        if (sdpResp.status === 401) {
+          ({ token: EPHEMERAL, model: MODEL } = await getEphemeral());
+          sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${EPHEMERAL}`, 'Content-Type': 'application/sdp' },
+            body: pc.localDescription.sdp
+          });
+        }
+        if (!sdpResp.ok) {
+          const msg = await sdpResp.text().catch(()=>String(sdpResp.status));
+          alert('Realtime handshake failed:\n' + msg);
+          startBtn.disabled=false; endBtn.disabled=true; return;
+        }
+      }
+
       const answer = { type: 'answer', sdp: await sdpResp.text() };
       await pc.setRemoteDescription(answer);
     }
