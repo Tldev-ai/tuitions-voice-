@@ -75,7 +75,7 @@
 </head>
 <body>
   <header class="top">
-    <!-- Make sure this file exists at /public/assets/iituitions-logo.png -->
+    <!-- Ensure this exists at /public/assets/iituitions-logo.png -->
     <a class="brand" href="#"><img src="/assets/iituitions-logo.png" alt="logo" style="height:24px"> iiTuitions</a>
   </header>
 
@@ -131,18 +131,21 @@
         <span class="right">Prefer a person? Call <b>+91-XXXXXXXXXX</b></span>
       </p>
 
-      <!-- hidden log (optional) -->
+      <!-- hidden log (optional while debugging) -->
       <pre id="log" style="display:none"></pre>
     </section>
   </main>
 
-  <!-- ===== Voice logic ===== -->
+  <!-- ===== Voice logic with reliable Realtime flow ===== -->
   <script>
     const startBtn = document.getElementById('startBtn');
     const endBtn   = document.getElementById('endBtn');
     const aiAudio  = document.getElementById('aiAudio');
     const consent  = document.getElementById('consent');
     const led      = document.getElementById('led');
+    const logEl    = document.getElementById('log');
+
+    function log(...args){ console.log('[voice]', ...args); if(logEl){ logEl.textContent += args.map(a => (typeof a==='string'?a:JSON.stringify(a))).join(' ') + '\n'; } }
 
     let pc, dc, localStream, remoteStream, mediaRecorder, recordedChunks = [];
     let silenceRAF, silenceTimer, analyser, dataArray;
@@ -152,116 +155,153 @@
 
     function timeOfDay(){ const h=new Date().getHours(); return h<12?'morning':h<17?'afternoon':h<21?'evening':'night'; }
 
-    function diag(...a){ try{ console.log('[voice]', ...a); }catch{} }
+    async function fetchEphemeral(){
+      const res = await fetch('/api/session', { headers:{ 'cache-control':'no-store' } });
+      if(!res.ok){
+        let msg = '';
+        try { msg = (await res.json()).error || ''; } catch(e){}
+        throw new Error(`Ephemeral fetch failed (${res.status}) ${msg}`);
+      }
+      return res.json();
+    }
 
-    async function getEphemeral() {
-      const r = await fetch('/api/session');
-      if (!r.ok) throw new Error('Session failed: ' + (await r.text()));
-      const j = await r.json();
-      return { token: j.client_secret.value, model: j.model || 'gpt-4o-realtime-preview' };
+    async function postSDP(ephemeral, model, sdp){
+      const url = `https://api.openai.com/v1/realtime?model=${encodeURIComponent(model || 'gpt-4o-realtime-preview')}`;
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${ephemeral}`, 'Content-Type': 'application/sdp' },
+        body: sdp
+      });
+      return r;
     }
 
     async function startCall() {
-      if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
-      startBtn.disabled = true; endBtn.disabled = false;
-
-      // 1) Prepare WebRTC first (no session fetch yet)
-      pc = new RTCPeerConnection();
-      dc = pc.createDataChannel('oai-events');
-
-      dc.onopen = () => {
-        const greet = `Hai. Good ${timeOfDay()}. Which language would you like to talk in — English, తెలుగు (Telugu), or हिन्दी (Hindi)?`;
-        try { dc.send(JSON.stringify({ type:'response.create', response:{ instructions:greet } })); } catch {}
-      };
-
       try {
-        localStream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
+        if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
+        startBtn.disabled = true; endBtn.disabled = false; logEl.style.display='block';
+
+        // 1) Get ephemeral quickly (keep total time < ~60s)
+        log('Fetching ephemeral…');
+        const sess = await fetchEphemeral();
+        const EPHEMERAL = sess.client_secret?.value;
+        const MODEL = sess.model || 'gpt-4o-realtime-preview';
+        if(!EPHEMERAL){ throw new Error('No client_secret in /api/session response'); }
+        log('Ephemeral ok, model =', MODEL);
+
+        // 2) RTCPeerConnection with STUN servers (improves connectivity)
+        pc = new RTCPeerConnection({
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:global.stun.twilio.com:3478?transport=udp' }
+          ]
         });
-      } catch {
-        alert('Microphone blocked. Click the mic icon in the address bar and Allow, then reload.');
-        startBtn.disabled=false; endBtn.disabled=true; return;
-      }
-      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-      pc.onconnectionstatechange = () => diag('pc state:', pc.connectionState);
-      pc.oniceconnectionstatechange = () => diag('ice state:', pc.iceConnectionState);
+        pc.onconnectionstatechange = () => log('PC state:', pc.connectionState);
+        pc.onicegatheringstatechange = () => log('ICE gather:', pc.iceGatheringState);
+        pc.onicecandidateerror = e => log('ICE candidate error:', e.errorText || e);
 
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const dest = ctx.createMediaStreamDestination();
-
-      pc.ontrack = (ev) => {
-        remoteStream = ev.streams[0];
-        aiAudio.srcObject = remoteStream;
-
-        const micSrc = ctx.createMediaStreamSource(localStream);
-        const aiSrc  = ctx.createMediaStreamSource(remoteStream);
-        micSrc.connect(dest); aiSrc.connect(dest);
-
-        analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
-        const micTap = ctx.createMediaStreamSource(localStream);
-        micTap.connect(analyser);
-        dataArray = new Float32Array(analyser.fftSize);
-
-        const resetSilence = () => {
-          if (silenceTimer) clearTimeout(silenceTimer);
-          silenceTimer = setTimeout(() => {
-            try {
-              dc?.send(JSON.stringify({ type:'response.create', response:{ instructions:"Sorry, I'm unable to hear you. I'll end this call now." } }));
-            } catch {}
-            setTimeout(endCall, 1800);
-          }, SILENCE_MS);
+        // Data channel for initial greeting
+        dc = pc.createDataChannel('oai-events');
+        dc.onopen = () => {
+          log('DataChannel open → send greeting');
+          const greet = `Hai. Good ${timeOfDay()}. Which language would you like to talk in — English, తెలుగు (Telugu), or हिन्दी (Hindi)?`;
+          try { dc.send(JSON.stringify({ type:'response.create', response:{ instructions:greet } })); } catch (e) { log('DC send error', e); }
         };
 
-        const monitor = () => {
-          analyser.getFloatTimeDomainData(dataArray);
-          let rms = 0; for (let i=0;i<dataArray.length;i++){ const v=dataArray[i]; rms += v*v; }
-          rms = Math.sqrt(rms / dataArray.length);
-          if (rms > RMS_THRESHOLD) { led.classList.add('on'); resetSilence(); }
-          else { led.classList.remove('on'); }
-          silenceRAF = requestAnimationFrame(monitor);
-        };
-        setTimeout(()=>{ resetSilence(); monitor(); }, 1200);
-
-        try { mediaRecorder = new MediaRecorder(dest.stream, { mimeType: 'audio/webm;codecs=opus' }); }
-        catch { mediaRecorder = new MediaRecorder(dest.stream); }
-        mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
-        mediaRecorder.start(250);
-      };
-
-      // 2) Create offer and finish ICE gathering
-      const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
-      await new Promise((resolve) => {
-        if (pc.iceGatheringState === 'complete') return resolve();
-        pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') resolve(); };
-      });
-
-      // 3) Fetch ephemeral token RIGHT BEFORE posting SDP; retry once on 401
-      let { token: EPHEMERAL, model: MODEL } = await getEphemeral();
-      let sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${EPHEMERAL}`, 'Content-Type': 'application/sdp' },
-        body: pc.localDescription.sdp
-      });
-
-      if (!sdpResp.ok) {
-        if (sdpResp.status === 401) {
-          ({ token: EPHEMERAL, model: MODEL } = await getEphemeral());
-          sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`, {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${EPHEMERAL}`, 'Content-Type': 'application/sdp' },
-            body: pc.localDescription.sdp
+        // 3) Microphone
+        try {
+          localStream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
           });
+        } catch (e) {
+          alert('Microphone blocked. Click the mic icon in the address bar and Allow, then reload.');
+          throw e;
         }
-        if (!sdpResp.ok) {
-          const msg = await sdpResp.text().catch(()=>String(sdpResp.status));
-          alert('Realtime handshake failed:\n' + msg);
-          startBtn.disabled=false; endBtn.disabled=true; return;
-        }
-      }
+        localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-      const answer = { type: 'answer', sdp: await sdpResp.text() };
-      await pc.setRemoteDescription(answer);
+        // 4) Remote audio hookup + recorder + VAD
+        pc.ontrack = (ev) => {
+          log('Got remote track');
+          remoteStream = ev.streams[0];
+          aiAudio.srcObject = remoteStream;
+          aiAudio.muted = false;
+          aiAudio.autoplay = true;
+          aiAudio.play().catch(err => log('audio.play error:', err));
+
+          const ctx = new (window.AudioContext || window.webkitAudioContext)();
+          const dest = ctx.createMediaStreamDestination();
+
+          const micSrc = ctx.createMediaStreamSource(localStream);
+          const aiSrc  = ctx.createMediaStreamSource(remoteStream);
+          micSrc.connect(dest); aiSrc.connect(dest);
+
+          analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
+          const micTap = ctx.createMediaStreamSource(localStream);
+          micTap.connect(analyser);
+          dataArray = new Float32Array(analyser.fftSize);
+
+          const resetSilence = () => {
+            if (silenceTimer) clearTimeout(silenceTimer);
+            silenceTimer = setTimeout(() => {
+              try {
+                dc?.send(JSON.stringify({ type:'response.create', response:{ instructions:"Sorry, I'm unable to hear you. I'll end this call now." } }));
+              } catch {}
+              setTimeout(endCall, 1800);
+            }, SILENCE_MS);
+          };
+
+          const monitor = () => {
+            analyser.getFloatTimeDomainData(dataArray);
+            let rms = 0; for (let i=0;i<dataArray.length;i++){ const v=dataArray[i]; rms += v*v; }
+            rms = Math.sqrt(rms / dataArray.length);
+            if (rms > RMS_THRESHOLD) { led.classList.add('on'); resetSilence(); } else { led.classList.remove('on'); }
+            silenceRAF = requestAnimationFrame(monitor);
+          };
+          setTimeout(()=>{ resetSilence(); monitor(); }, 1200);
+
+          try { mediaRecorder = new MediaRecorder(dest.stream, { mimeType: 'audio/webm;codecs=opus' }); }
+          catch { mediaRecorder = new MediaRecorder(dest.stream); }
+          mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
+          mediaRecorder.start(250);
+        };
+
+        // 5) Offer → wait for full ICE gather (or 2s max)
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await new Promise((resolve) => {
+          if (pc.iceGatheringState === 'complete') return resolve();
+          const to = setTimeout(resolve, 2000);
+          pc.onicegatheringstatechange = () => {
+            if (pc.iceGatheringState === 'complete') { clearTimeout(to); resolve(); }
+          };
+        });
+
+        // 6) POST SDP (retry once on 401/403)
+        log('Posting SDP…');
+        let r = await postSDP(EPHEMERAL, MODEL, pc.localDescription.sdp);
+        if (r.status === 401 || r.status === 403) {
+          log('SDP unauthorized, refreshing ephemeral once…');
+          const again = await fetchEphemeral();
+          const EPH2 = again.client_secret?.value;
+          if(!EPH2) throw new Error('Second ephemeral fetch returned no client_secret');
+          r = await postSDP(EPH2, MODEL, pc.localDescription.sdp);
+        }
+        if (!r.ok) {
+          const text = await r.text();
+          log('SDP post failed:', r.status, text);
+          alert(`Failed to start audio session.\nStatus: ${r.status}\n${text}`);
+          throw new Error(`SDP post failed ${r.status}`);
+        }
+
+        const answer = { type: 'answer', sdp: await r.text() };
+        await pc.setRemoteDescription(answer);
+        log('Remote description set — waiting for connection…');
+
+      } catch (err) {
+        log('startCall error:', err?.message || err);
+        try { await endCall(); } catch {}
+        startBtn.disabled = false; endBtn.disabled = true;
+      }
     }
 
     async function endCall() {
@@ -271,13 +311,19 @@
       try { pc && pc.close(); } catch {}
       try { localStream && localStream.getTracks().forEach(t => t.stop()); } catch {}
 
-      const audioBlob = new Blob(recordedChunks, { type: 'audio/webm' });
-      const form = new FormData();
-      form.append('audio', audioBlob, 'conversation.webm');
-      form.append('transcriptJson', JSON.stringify({ endedAt: new Date().toISOString() }));
+      try {
+        if (recordedChunks.length) {
+          const audioBlob = new Blob(recordedChunks, { type: 'audio/webm' });
+          const form = new FormData();
+          form.append('audio', audioBlob, 'conversation.webm');
+          form.append('transcriptJson', JSON.stringify({ endedAt: new Date().toISOString() }));
+          const up = await fetch('/api/upload', { method: 'POST', body: form });
+          log('Upload status:', up.status);
+        }
+      } catch (e){ log('Upload error:', e); }
 
-      try { await fetch('/api/upload', { method: 'POST', body: form }); } catch {}
-      startBtn.disabled = false; recordedChunks = [];
+      recordedChunks = [];
+      startBtn.disabled = false;
     }
 
     startBtn.addEventListener('click', startCall);
