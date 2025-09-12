@@ -14,12 +14,13 @@
     .brand{display:flex;align-items:center;gap:8px;text-decoration:none;color:var(--ink);font-weight:800}
     .wrap{max-width:980px;margin:28px auto;padding:0 16px}
     .card{padding:24px;border:1px solid var(--ring);border-radius:16px;box-shadow:0 6px 28px rgba(0,0,0,.06);background:#fff}
-    h1{margin:0 0 10px} p{margin:0 0 14px}
+    h1{margin:0 0 10px}
     .row{display:flex;gap:12px;align-items:center;margin-top:12px;flex-wrap:wrap}
     button{display:inline-flex;gap:8px;align-items:center;justify-content:center;padding:12px 16px;border-radius:999px;border:0;
       background:#000;color:#fff;font-weight:800;cursor:pointer;letter-spacing:.2px}
     #startBtn{min-width:320px;padding:14px 36px;font-size:18px}
-    button.end{background:#000;color:#fff;border:2px solid #000} button:disabled{opacity:.6;cursor:not-allowed}
+    button.end{background:#000;color:#fff;border:2px solid #000}
+    button:disabled{opacity:.6;cursor:not-allowed}
     audio{display:none}
     .led{width:10px;height:10px;border-radius:999px;background:var(--idle);box-shadow:0 0 0 1px #0001}
     .led.on{background:#000}
@@ -33,12 +34,10 @@
   <main class="wrap">
     <section class="card">
       <h1>Talk to our Admissions Assistant</h1>
-
       <label style="display:flex;align-items:center;gap:8px;margin-top:10px">
         <input type="checkbox" id="consent" />
         I agree to the recording and storage of this conversation.
       </label>
-
       <div class="row">
         <button id="startBtn">Start Voice</button>
         <button id="endBtn" class="end" disabled>End</button>
@@ -57,16 +56,17 @@
 
     let pc, dc, localStream, remoteStream;
     let analyser, dataArray, silenceRAF, silenceTimer;
+    let lastResponseAt = 0;
+
     const SILENCE_MS = 15000, RMS_THRESHOLD = 0.006;
     const log = (...a)=>console.log(...a);
-
-    function timeOfDay(){ const h=new Date().getHours(); return h<12?'morning':h<17?'afternoon':h<21?'evening':'night'; }
+    const tod = ()=>{ const h=new Date().getHours(); return h<12?'morning':h<17?'afternoon':h<21?'evening':'night'; };
 
     async function startCall() {
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
       startBtn.disabled = true; endBtn.disabled = false;
 
-      // 1) Ask backend for: OpenAI ephemeral session + Twilio ICE
+      // 1) session + ICE from backend
       const sessResp = await fetch('/api/session');
       if (!sessResp.ok) {
         const err = await sessResp.json().catch(()=>({}));
@@ -78,50 +78,49 @@
       const MODEL = encodeURIComponent(sess?.model || 'gpt-4o-realtime-preview');
       const iceServers = sess?.ice_servers || [{ urls: ['stun:stun.l.google.com:19302'] }];
 
-      // 2) AudioContext (resume for autoplay)
+      // 2) AudioContext
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       if (ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
 
-      // 3) RTCPeerConnection — use Twilio ICE; force relay while testing strict Wi-Fi
+      // 3) RTCPeerConnection with ICE (TURN)
       pc = new RTCPeerConnection({
         iceServers,
-        // iceTransportPolicy: 'relay', // ← uncomment while testing on locked-down networks
+        // iceTransportPolicy: 'relay', // enable while testing strict Wi-Fi
       });
-      window.pc = pc;
-
       pc.oniceconnectionstatechange = () => log('ice:', pc.iceConnectionState);
       pc.onconnectionstatechange    = () => log('pc:', pc.connectionState);
 
-      // 4) Single bidirectional transceiver + prefer Opus
+      // 4) One bidirectional transceiver + prefer Opus
       const tx = pc.addTransceiver('audio', { direction: 'sendrecv' });
       try {
         const caps = RTCRtpReceiver.getCapabilities('audio');
-        const opusOnly = caps.codecs.filter(c => c.mimeType.toLowerCase() === 'audio/opus');
-        if (opusOnly.length) tx.setCodecPreferences(opusOnly);
+        const opus = caps.codecs.filter(c=>c.mimeType.toLowerCase()==='audio/opus');
+        if (opus.length) tx.setCodecPreferences(opus);
       } catch {}
 
-      // 5) DataChannel to control session
+      // 5) DataChannel to drive responses
       dc = pc.createDataChannel('oai-events');
 
-      // Auto-reply: when server VAD says speech stopped, ask the model to speak
       dc.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data);
-          // uncomment to debug: console.log('OAI:', msg.type || msg);
+          console.log('OAI:', msg.type || msg);
+
+          // after every user turn, ask the model to speak
           if (msg.type === 'input_audio_buffer.speech_stopped') {
-            dc.send(JSON.stringify({
-              type: 'response.create',
-              response: { modalities: ['audio'] }
-            }));
+            dc.send(JSON.stringify({ type:'response.create', response:{ modalities:['audio'] } }));
+          }
+
+          if (msg.type === 'response.created' || msg.type === 'response.done') {
+            lastResponseAt = Date.now();
           }
         } catch {
-          // raw string messages
-          // console.log('OAI raw:', e.data);
+          console.log('OAI raw:', e.data);
         }
       };
 
       dc.onopen = () => {
-        // Session defaults (also set on server)
+        // configure session
         dc.send(JSON.stringify({
           type: 'session.update',
           session: {
@@ -130,14 +129,20 @@
             turn_detection: { type: 'server_vad', silence_duration_ms: 700 }
           }
         }));
-        // Friendly hello
-        dc.send(JSON.stringify({
+
+        // reliable greeting (with 1s retry if nothing started)
+        const greet = `Hai. Good ${tod()}. May I record this short call for admission support? Which language would you like — English, తెలుగు (Telugu), or हिन्दी (Hindi)?`;
+
+        const fireGreeting = () => dc.send(JSON.stringify({
           type: 'response.create',
-          response: { modalities: ['audio'], instructions: `Hai. Good ${timeOfDay()}. May I record this short call for admission support? Which language would you like — English, తెలుగు (Telugu), or हिन्दी (Hindi)?` }
+          response: { modalities:['audio'], instructions: greet }
         }));
+
+        fireGreeting();
+        setTimeout(() => { if (!lastResponseAt && dc?.readyState === 'open') fireGreeting(); }, 1000);
       };
 
-      // 6) Mic → attach to THIS transceiver (no addTrack)
+      // 6) Mic publish via replaceTrack
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
@@ -148,7 +153,7 @@
       }
       tx.sender.replaceTrack(localStream.getAudioTracks()[0]);
 
-      // 7) Remote audio + mic LED + silence monitor
+      // 7) Remote audio + silence monitor
       pc.ontrack = (ev) => {
         const stream = ev.streams?.[0] || new MediaStream([ev.track]);
         if (!remoteStream) remoteStream = stream;
@@ -157,9 +162,8 @@
         aiAudio.play().catch(()=>{});
         ev.track.onunmute = () => log('remote track unmuted (audio flowing)');
 
-        const ac = ctx;
-        analyser = ac.createAnalyser(); analyser.fftSize = 2048;
-        const micTap = ac.createMediaStreamSource(localStream);
+        analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
+        const micTap = ctx.createMediaStreamSource(localStream);
         dataArray = new Float32Array(analyser.fftSize);
         micTap.connect(analyser);
 
@@ -172,7 +176,6 @@
                 response:{ modalities:['audio'], instructions:"Sorry, I'm unable to hear you. I'll end this call now." }
               }));
             } catch {}
-            setTimeout(endCall, 1800);
           }, SILENCE_MS);
         };
 
@@ -184,10 +187,10 @@
           else { led.classList.remove('on'); }
           silenceRAF = requestAnimationFrame(monitor);
         };
-        setTimeout(()=>{ resetSilence(); monitor(); }, 1000);
+        setTimeout(()=>{ resetSilence(); monitor(); }, 800);
       };
 
-      // 8) SDP offer/answer with OpenAI
+      // 8) SDP with OpenAI
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       await new Promise((resolve) => {
