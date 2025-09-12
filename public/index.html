@@ -271,10 +271,15 @@
       });
 
       const sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${MODEL}`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${EPHEMERAL}`, 'Content-Type': 'application/sdp' },
-        body: pc.localDescription.sdp
-      });
+  method: 'POST',
+  headers: {
+    'Authorization': `Bearer ${EPHEMERAL}`,
+    'Content-Type': 'application/sdp',
+    'OpenAI-Beta': 'realtime=v1'      // <-- IMPORTANT
+  },
+  body: pc.localDescription.sdp
+});
+
 
       if (!sdpResp.ok) {
         const t = await sdpResp.text();
