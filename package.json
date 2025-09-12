@@ -1,0 +1,11 @@
+{
+  "name": "iit-voice-mvp",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "22.x" },
+  "scripts": { "dev": "vercel dev" },
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "googleapis": "^159.0.0"
+  }
+}
