@@ -120,12 +120,12 @@
         <span class="right">Prefer a person? Call <b>+91-XXXXXXXXXX</b></span>
       </p>
 
-      <!-- hidden log (unchanged functionality) -->
+      <!-- hidden log (optional) -->
       <pre id="log" style="display:none"></pre>
     </section>
   </main>
 
-  <!-- ===== Voice logic (unchanged) ===== -->
+  <!-- ===== Voice logic ===== -->
   <script>
     const startBtn = document.getElementById('startBtn');
     const endBtn   = document.getElementById('endBtn');
@@ -145,6 +145,7 @@
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
       startBtn.disabled = true; endBtn.disabled = false;
 
+      // 1) Get ephemeral key from your backend
       const resp = await fetch('/api/session');
       if (!resp.ok) {
         const err = await resp.json().catch(()=>({}));
@@ -152,17 +153,57 @@
         startBtn.disabled=false; endBtn.disabled=true; return;
       }
       const sess = await resp.json();
-      const EPHEMERAL = sess.client_secret.value;
-      const MODEL = encodeURIComponent(sess.model || 'gpt-4o-realtime-preview');
+      const EPHEMERAL = sess?.client_secret?.value;
+      const MODEL = encodeURIComponent(sess?.model || 'gpt-4o-realtime-preview');
 
-      pc = new RTCPeerConnection();
+      // 2) AudioContext must be resumed on user gesture (prevents autoplay blocks)
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      if (ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
+
+      // 3) Create RTCPeerConnection and explicitly request to RECEIVE audio
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
+      });
+      pc.addTransceiver('audio', { direction: 'sendrecv' }); // <-- critical for remote audio
+
+      // helpful logs
+      pc.oniceconnectionstatechange = () => console.log('ice:', pc.iceConnectionState);
+      pc.onconnectionstatechange   = () => console.log('pc:', pc.connectionState);
+
+      // 4) Data channel for session control/events
       dc = pc.createDataChannel('oai-events');
 
-      dc.onopen = () => {
-        const greet = `Hai. Good ${timeOfDay()}. Which language would you like to talk in — English, తెలుగు (Telugu), or हिन्दी (Hindi)?`;
-        try { dc.send(JSON.stringify({ type:'response.create', response:{ instructions:greet } })); } catch {}
+      dc.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg?.type?.includes?.('error') || msg?.level === 'error') console.error('OAI error:', msg);
+          else console.log('OAI:', msg?.type || msg);
+        } catch {
+          console.log('OAI raw:', e.data);
+        }
       };
 
+      // 5) On open, configure the session so the model SPEAKS
+      dc.onopen = () => {
+        // set voice + modalities + server VAD
+        dc.send(JSON.stringify({
+          type: 'session.update',
+          session: {
+            modalities: ['audio','text'],
+            voice: 'verse',                           // choose any available voice
+            turn_detection: { type: 'server_vad', silence_duration_ms: 500 }
+          }
+        }));
+
+        // friendly greeting
+        const greet = `Hi! Good ${timeOfDay()}. Which language would you like to talk in — English, Telugu, or Hindi?`;
+        dc.send(JSON.stringify({
+          type: 'response.create',
+          response: { modalities: ['audio'], instructions: greet }
+        }));
+      };
+
+      // 6) Get microphone and publish
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
@@ -173,17 +214,20 @@
       }
       localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      // 7) When model sends audio back, attach to <audio> and also mirror to recorder
       const dest = ctx.createMediaStreamDestination();
-
       pc.ontrack = (ev) => {
         remoteStream = ev.streams[0];
         aiAudio.srcObject = remoteStream;
+        aiAudio.muted = false;
+        aiAudio.play().catch(()=>{}); // ensure playback after click gesture
 
+        // mix mic + ai to one stream for recording
         const micSrc = ctx.createMediaStreamSource(localStream);
         const aiSrc  = ctx.createMediaStreamSource(remoteStream);
         micSrc.connect(dest); aiSrc.connect(dest);
 
+        // LED + silence monitor (from mic)
         analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
         const micTap = ctx.createMediaStreamSource(localStream);
         micTap.connect(analyser);
@@ -193,7 +237,7 @@
           if (silenceTimer) clearTimeout(silenceTimer);
           silenceTimer = setTimeout(() => {
             try {
-              dc?.send(JSON.stringify({ type:'response.create', response:{ instructions:"Sorry, I'm unable to hear you. I'll end this call now." } }));
+              dc?.send(JSON.stringify({ type:'response.create', response:{ modalities:['audio'], instructions:"Sorry, I'm unable to hear you. I'll end this call now." } }));
             } catch {}
             setTimeout(endCall, 1800);
           }, SILENCE_MS);
@@ -215,16 +259,31 @@
         mediaRecorder.start(250);
       };
 
-      const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
+      // 8) Create SDP offer, wait for ICE gather, send to OpenAI, set answer
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
       await new Promise((resolve) => {
         if (pc.iceGatheringState === 'complete') return resolve();
         pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') resolve(); };
+        // safety timeout
+        setTimeout(resolve, 1500);
       });
+
       const sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${MODEL}`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${EPHEMERAL}`, 'Content-Type': 'application/sdp' },
         body: pc.localDescription.sdp
       });
+
+      if (!sdpResp.ok) {
+        const t = await sdpResp.text();
+        console.error('Realtime SDP error:', t);
+        alert('Realtime connection failed. Check model/quota or ephemeral key.');
+        endCall();
+        return;
+      }
+
       const answer = { type: 'answer', sdp: await sdpResp.text() };
       await pc.setRemoteDescription(answer);
     }
@@ -236,17 +295,21 @@
       try { pc && pc.close(); } catch {}
       try { localStream && localStream.getTracks().forEach(t => t.stop()); } catch {}
 
-      const audioBlob = new Blob(recordedChunks, { type: 'audio/webm' });
-      const form = new FormData();
-      form.append('audio', audioBlob, 'conversation.webm');
-      form.append('transcriptJson', JSON.stringify({ endedAt: new Date().toISOString() }));
+      // upload the recording (optional)
+      if (recordedChunks.length) {
+        const audioBlob = new Blob(recordedChunks, { type: 'audio/webm' });
+        const form = new FormData();
+        form.append('audio', audioBlob, 'conversation.webm');
+        form.append('transcriptJson', JSON.stringify({ endedAt: new Date().toISOString() }));
+        try { await fetch('/api/upload', { method: 'POST', body: form }); } catch {}
+      }
 
-      try { await fetch('/api/upload', { method: 'POST', body: form }); } catch {}
       startBtn.disabled = false; recordedChunks = [];
     }
 
     startBtn.addEventListener('click', startCall);
     endBtn.addEventListener('click', endCall);
+    window.addEventListener('beforeunload', () => { try { pc && pc.close(); } catch {} });
   </script>
 </body>
 </html>
