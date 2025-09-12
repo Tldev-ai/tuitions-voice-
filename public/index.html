@@ -42,7 +42,6 @@
     <section class="card">
       <h1>Talk to our Admissions Assistant</h1>
       <p class="sub muted">Get answers in <b>2–3 minutes</b>. Available in <b>English / తెలుగు / हिन्दी</b>.</p>
-
       <p>Click below to speak. Your conversation is recorded (audio + summary) for follow-up.</p>
 
       <div class="section-title">I can help with</div>
@@ -114,7 +113,7 @@
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
       startBtn.disabled = true; endBtn.disabled = false;
 
-      // 1) Get ephemeral key/model from your backend
+      // 1) ephemeral session from your server
       const resp = await fetch('/api/session');
       if (!resp.ok) {
         const err = await resp.json().catch(()=>({}));
@@ -129,25 +128,27 @@
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       if (ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
 
-      // 3) PeerConnection; (flip to 'relay' if your Wi-Fi blocks SRTP)
+      // 3) PeerConnection (uncomment relay line if your Wi-Fi blocks SRTP)
       pc = new RTCPeerConnection({
-        iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
-        // iceTransportPolicy: 'relay', // ← uncomment if network is strict/NATed
+        iceServers: [
+          { urls: ['stun:stun.l.google.com:19302'] },
+          // Add your TURN for production:
+          // { urls: 'turn:YOUR_TURN_HOST:3478', username: 'USER', credential: 'PASS' }
+        ],
+        // iceTransportPolicy: 'relay', // ← enable if needed on strict networks
       });
       pc.oniceconnectionstatechange = () => log('ice:', pc.iceConnectionState);
       pc.onconnectionstatechange   = () => log('pc:', pc.connectionState);
 
-      // === ONE bidirectional audio m-line via transceiver ===
+      // === ONE bidirectional audio m-line ===
       const tx = pc.addTransceiver('audio', { direction: 'sendrecv' });
-
-      // Force OPUS so negotiation is predictable
       try {
         const caps = RTCRtpReceiver.getCapabilities('audio');
         const opusOnly = caps.codecs.filter(c => c.mimeType.toLowerCase() === 'audio/opus');
         if (opusOnly.length) tx.setCodecPreferences(opusOnly);
-      } catch (e) { /* some browsers may not expose caps */ }
+      } catch {}
 
-      // 4) Data channel for session control/events
+      // 4) DataChannel
       dc = pc.createDataChannel('oai-events');
       dc.onmessage = (e) => {
         try {
@@ -157,7 +158,6 @@
         } catch { log('OAI raw:', e.data); }
       };
       dc.onopen = () => {
-        // Configure the session to speak
         dc.send(JSON.stringify({
           type: 'session.update',
           session: {
@@ -166,14 +166,13 @@
             turn_detection: { type: 'server_vad', silence_duration_ms: 500 }
           }
         }));
-        // Optional greeting
         dc.send(JSON.stringify({
           type: 'response.create',
           response: { modalities: ['audio'], instructions: `Hi! Good ${timeOfDay()}. Which language would you like to talk in — English, Telugu, or Hindi?` }
         }));
       };
 
-      // 5) Get microphone and attach to THIS transceiver (no addTrack)
+      // 5) Mic → attach to THIS transceiver (no addTrack)
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
@@ -182,27 +181,24 @@
         alert('Microphone blocked. Click the mic icon in the address bar and Allow, then reload.');
         startBtn.disabled=false; endBtn.disabled=true; return;
       }
-      tx.sender.replaceTrack(localStream.getAudioTracks()[0]);  // ← key change
+      tx.sender.replaceTrack(localStream.getAudioTracks()[0]);
 
-      // 6) Remote audio handling (robust; force playback)
+      // 6) Remote audio
       const dest = ctx.createMediaStreamDestination();
       pc.ontrack = (ev) => {
-        log('ontrack', ev.track.kind, 'muted=', ev.track.muted);
-        const track = ev.track;
-        if (!remoteStream) remoteStream = ev.streams?.[0] || new MediaStream();
-        if (ev.streams?.length === 0) remoteStream.addTrack(track);
-
+        log('ontrack audio muted=', ev.track.muted);
+        remoteStream = ev.streams?.[0] || new MediaStream([ev.track]);
         aiAudio.srcObject = remoteStream;
         aiAudio.muted = false;
         aiAudio.setSinkId?.('default').catch(()=>{});
-        aiAudio.play().catch(()=>{}); // ensure playback post-click
+        aiAudio.play().catch(()=>{});
+        ev.track.onunmute = () => log('remote track unmuted (audio flowing)');
 
-        // Mix mic+AI into recorder
+        // Recorder (mix mic + ai)
         const micSrc = ctx.createMediaStreamSource(localStream);
         const aiSrc  = ctx.createMediaStreamSource(remoteStream);
         micSrc.connect(dest); aiSrc.connect(dest);
 
-        // LED + silence monitor (from mic)
         analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
         const micTap = ctx.createMediaStreamSource(localStream);
         micTap.connect(analyser);
@@ -217,7 +213,6 @@
             setTimeout(endCall, 1800);
           }, SILENCE_MS);
         };
-
         const monitor = () => {
           analyser.getFloatTimeDomainData(dataArray);
           let rms = 0; for (let i=0;i<dataArray.length;i++){ const v=dataArray[i]; rms += v*v; }
@@ -228,19 +223,18 @@
         };
         setTimeout(()=>{ resetSilence(); monitor(); }, 1200);
 
-        // Recorder
         try { mediaRecorder = new MediaRecorder(dest.stream, { mimeType: 'audio/webm;codecs=opus' }); }
         catch { mediaRecorder = new MediaRecorder(dest.stream); }
         mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
         mediaRecorder.start(250);
 
-        // One-line voice check
+        // one-line voice check to confirm audio path
         try {
           dc?.send(JSON.stringify({ type:'response.create', response:{ modalities:['audio'], instructions:'Voice check okay.' } }));
         } catch {}
       };
 
-      // 7) Create SDP, wait for ICE, send to OpenAI, set answer
+      // 7) SDP offer/answer with OpenAI
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       await new Promise((resolve) => {
