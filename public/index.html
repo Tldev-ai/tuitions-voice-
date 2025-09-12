@@ -5,72 +5,22 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>iiTuitions — Voice</title>
   <style>
-    /* === black/white text + light blue background gradient === */
-    :root{
-      --ink:#000000;     /* all text in black */
-      --ring:#e5e7eb;
-      --idle:#bbbbbb;    /* mic LED idle (grey) */
-    }
-    *{box-sizing:border-box}
-    body{
-      margin:0;
-      color:var(--ink);
-      font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;
-      background: linear-gradient(180deg, #9EC3F2 0%, #DCE7F7 100%);
-      min-height:100vh;
-    }
-
-    .top{
-      display:flex;align-items:center;gap:10px;
-      border-bottom:1px solid var(--ring);
-      padding:12px 16px;
-      background:#ffffffcc; /* white with slight transparency */
-      backdrop-filter:saturate(120%) blur(6px);
-    }
+    :root{ --ink:#0b1220; --ring:#e5e7eb; --muted:#4b5563; --ok:#10b981; --idle:#9ca3af; }
+    *{box-sizing:border-box} body{margin:0;font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;color:var(--ink);background:#fff}
+    .top{display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--ring);padding:12px 16px}
     .brand{display:flex;align-items:center;gap:8px;text-decoration:none;color:var(--ink);font-weight:800}
-
-    .wrap{max-width:980px;margin:28px auto;padding:0 16px}
-    .card{padding:24px;border:1px solid var(--ring);border-radius:16px;box-shadow:0 6px 28px rgba(0,0,0,.06);background:#fff}
-
-    h1{margin:0 0 10px;color:#000}
-    p{margin:0 0 14px;color:#000}
-    .sub{margin:-6px 0 14px;font-weight:600}
-    .muted{opacity:.9}
-
-    .consent{display:flex;align-items:center;gap:8px;color:#000;margin-top:10px}
-
+    .wrap{max-width:760px;margin:28px auto;padding:0 16px}
+    .card{padding:24px;border:1px solid var(--ring);border-radius:16px;box-shadow:0 6px 28px rgba(0,0,0,.06)}
+    h1{margin:0 0 10px}
+    .consent{display:flex;align-items:center;gap:8px;color:var(--muted);margin-top:10px}
     .row{display:flex;gap:12px;align-items:center;margin-top:12px;flex-wrap:wrap}
-
-    /* Buttons: black/white only. Make Start Voice wider horizontally */
-    button{
-      display:inline-flex;gap:8px;align-items:center;justify-content:center;
-      padding:12px 16px;border-radius:999px;border:0;background:#000;color:#fff;
-      font-weight:800;cursor:pointer;letter-spacing:.2px
-    }
-    #startBtn{
-      min-width: 320px;        /* wider */
-      padding: 14px 36px;      /* more horizontal padding */
-      font-size: 18px;         /* a bit larger text */
-    }
-    button.end{background:#000;color:#fff;border:2px solid #000} /* keep B/W theme */
+    button{display:inline-flex;gap:8px;align-items:center;padding:12px 16px;border-radius:999px;border:0;background:#111;color:#fff;font-weight:800;cursor:pointer}
+    button.end{background:#ef4444}
     button:disabled{opacity:.6;cursor:not-allowed}
-
-    .fine{font-size:12px;color:#000;margin-top:8px}
-
+    .fine{font-size:12px;color:#6b7280;margin-top:8px}
     audio{display:none}
-
-    /* LED: keep black/white (idle grey, active black) */
     .led{width:10px;height:10px;border-radius:999px;background:var(--idle);box-shadow:0 0 0 1px #00000010}
-    .led.on{background:#000}
-
-    /* content lists */
-    ul, ol{margin:8px 0 14px 20px}
-    li{margin:4px 0}
-    .section-title{font-weight:800;margin-top:10px}
-    .divider{height:1px;background:#eee;margin:14px 0;border-radius:1px}
-    .footer-note{font-size:13px;margin-top:2px}
-    .right{float:right}
-    @media (max-width:640px){ .right{float:none;display:block;margin-top:6px} }
+    .led.on{background:var(--ok)}
   </style>
 </head>
 <body>
@@ -81,27 +31,7 @@
   <main class="wrap">
     <section class="card">
       <h1>Talk to our Admissions Assistant</h1>
-      <p class="sub muted">Get answers in <b>2–3 minutes</b>. Available in <b>English / తెలుగు / हिन्दी</b>.</p>
-
       <p>Click below to speak. Your conversation is recorded (audio + summary) for follow-up.</p>
-
-      <div class="section-title">I can help with</div>
-      <ul>
-        <li>Course options, fees, and current batches</li>
-        <li>Home tutoring vs. online classes</li>
-        <li>Board/grade &amp; subject guidance</li>
-        <li>Demo class and timings</li>
-        <li>Scholarships / discounts (if available)</li>
-      </ul>
-
-      <div class="section-title">Keep these handy</div>
-      <ul>
-        <li>Student name &amp; grade/board</li>
-        <li>Subjects needed</li>
-        <li>Location or <b>Online</b> preference</li>
-        <li>Preferred time to call back</li>
-        <li>Budget range (optional)</li>
-      </ul>
 
       <label class="consent">
         <input type="checkbox" id="consent" />
@@ -115,27 +45,11 @@
         <audio id="aiAudio" autoplay playsinline></audio>
       </div>
 
-      <div class="fine">Tip: say <b>“Switch to Telugu”</b> or <b>“Switch to Hindi”</b> anytime.</div>
-
-      <div class="divider"></div>
-
-      <div class="section-title">What happens after this call</div>
-      <ol>
-        <li>You’ll get a short <b>summary</b> of the call.</li>
-        <li>Our counselor will reach out within <b>one working day</b>.</li>
-        <li>If you want a demo, we’ll schedule it for your preferred time.</li>
-      </ol>
-
-      <p class="footer-note"><b>Privacy:</b> We record this call (audio + summary) only for admission support and store it securely in our institute’s Google Drive. We never share your data outside iiTuitions.
-        <span class="right">Prefer a person? Call <b>+91-XXXXXXXXXX</b></span>
-      </p>
-
-      <!-- hidden log (unchanged functionality) -->
+      <div class="fine">Tip: use headphones to avoid echo.</div>
       <pre id="log" style="display:none"></pre>
     </section>
   </main>
 
-  <!-- ===== Voice logic (unchanged) ===== -->
   <script>
     const startBtn = document.getElementById('startBtn');
     const endBtn   = document.getElementById('endBtn');
@@ -155,6 +69,7 @@
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
       startBtn.disabled = true; endBtn.disabled = false;
 
+      // Get ephemeral session
       const resp = await fetch('/session');
       if (!resp.ok) {
         const err = await resp.json().catch(()=>({}));
@@ -165,14 +80,17 @@
       const EPHEMERAL = sess.client_secret.value;
       const MODEL = encodeURIComponent(sess.model || 'gpt-4o-realtime-preview');
 
+      // PeerConnection
       pc = new RTCPeerConnection();
       dc = pc.createDataChannel('oai-events');
 
+      // Proactive greeting (Hai + time + language)
       dc.onopen = () => {
         const greet = `Hai. Good ${timeOfDay()}. Which language would you like to talk in — English, తెలుగు (Telugu), or हिन्दी (Hindi)?`;
         try { dc.send(JSON.stringify({ type:'response.create', response:{ instructions:greet } })); } catch {}
       };
 
+      // Mic
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
@@ -183,6 +101,7 @@
       }
       localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
+      // Playback + recording + silence detection
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       const dest = ctx.createMediaStreamDestination();
 
@@ -194,6 +113,7 @@
         const aiSrc  = ctx.createMediaStreamSource(remoteStream);
         micSrc.connect(dest); aiSrc.connect(dest);
 
+        // silence detector (on mic)
         analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
         const micTap = ctx.createMediaStreamSource(localStream);
         micTap.connect(analyser);
@@ -219,12 +139,14 @@
         };
         setTimeout(()=>{ resetSilence(); monitor(); }, 1200);
 
+        // Recorder (mix mic + AI)
         try { mediaRecorder = new MediaRecorder(dest.stream, { mimeType: 'audio/webm;codecs=opus' }); }
         catch { mediaRecorder = new MediaRecorder(dest.stream); }
         mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
         mediaRecorder.start(250);
       };
 
+      // SDP offer/answer
       const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
       await new Promise((resolve) => {
         if (pc.iceGatheringState === 'complete') return resolve();
@@ -246,6 +168,7 @@
       try { pc && pc.close(); } catch {}
       try { localStream && localStream.getTracks().forEach(t => t.stop()); } catch {}
 
+      // Upload
       const audioBlob = new Blob(recordedChunks, { type: 'audio/webm' });
       const form = new FormData();
       form.append('audio', audioBlob, 'conversation.webm');
