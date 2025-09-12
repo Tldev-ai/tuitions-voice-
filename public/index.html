@@ -5,62 +5,32 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>iiTuitions — Voice</title>
   <style>
-    /* === black/white text + light blue background gradient === */
-    :root{
-      --ink:#000000; /* all text in black */
-      --ring:#e5e7eb;
-      --idle:#bbbbbb; /* mic LED idle (grey) */
-    }
+    :root{ --ink:#000; --ring:#e5e7eb; --idle:#bbb; }
     *{box-sizing:border-box}
-    body{
-      margin:0;
-      color:var(--ink);
-      font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;
-      background: linear-gradient(180deg, #9EC3F2 0%, #DCE7F7 100%);
-      min-height:100vh;
-    }
-    .top{
-      display:flex;align-items:center;gap:10px;
-      border-bottom:1px solid var(--ring);
-      padding:12px 16px;
-      background:#ffffffcc; /* white with slight transparency */
-      backdrop-filter:saturate(120%) blur(6px);
-    }
+    body{ margin:0; color:var(--ink); font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;
+      background:linear-gradient(180deg,#9EC3F2 0%,#DCE7F7 100%); min-height:100vh; }
+    .top{ display:flex;align-items:center;gap:10px; border-bottom:1px solid var(--ring);
+      padding:12px 16px; background:#ffffffcc; backdrop-filter:saturate(120%) blur(6px); }
     .brand{display:flex;align-items:center;gap:8px;text-decoration:none;color:var(--ink);font-weight:800}
     .wrap{max-width:980px;margin:28px auto;padding:0 16px}
     .card{padding:24px;border:1px solid var(--ring);border-radius:16px;box-shadow:0 6px 28px rgba(0,0,0,.06);background:#fff}
-    h1{margin:0 0 10px;color:#000}
-    p{margin:0 0 14px;color:#000}
-    .sub{margin:-6px 0 14px;font-weight:600}
-    .muted{opacity:.9}
-    .consent{display:flex;align-items:center;gap:8px;color:#000;margin-top:10px}
+    h1{margin:0 0 10px} p{margin:0 0 14px}
+    .sub{margin:-6px 0 14px;font-weight:600} .muted{opacity:.9}
+    .consent{display:flex;align-items:center;gap:8px;margin-top:10px}
     .row{display:flex;gap:12px;align-items:center;margin-top:12px;flex-wrap:wrap}
-    /* Buttons: black/white only. Make Start Voice wider horizontally */
-    button{
-      display:inline-flex;gap:8px;align-items:center;justify-content:center;
-      padding:12px 16px;border-radius:999px;border:0;background:#000;color:#fff;
-      font-weight:800;cursor:pointer;letter-spacing:.2px
-    }
-    #startBtn{
-      min-width: 320px; /* wider */
-      padding: 14px 36px; /* more horizontal padding */
-      font-size: 18px; /* a bit larger text */
-    }
-    button.end{background:#000;color:#fff;border:2px solid #000} /* keep B/W theme */
-    button:disabled{opacity:.6;cursor:not-allowed}
-    .fine{font-size:12px;color:#000;margin-top:8px}
+    button{display:inline-flex;gap:8px;align-items:center;justify-content:center;padding:12px 16px;border-radius:999px;border:0;
+      background:#000;color:#fff;font-weight:800;cursor:pointer;letter-spacing:.2px}
+    #startBtn{min-width:320px;padding:14px 36px;font-size:18px}
+    button.end{background:#000;color:#fff;border:2px solid #000} button:disabled{opacity:.6;cursor:not-allowed}
+    .fine{font-size:12px;margin-top:8px}
     audio{display:none}
-    /* LED: keep black/white (idle grey, active black) */
-    .led{width:10px;height:10px;border-radius:999px;background:var(--idle);box-shadow:0 0 0 1px #00000010}
+    .led{width:10px;height:10px;border-radius:999px;background:var(--idle);box-shadow:0 0 0 1px #0001}
     .led.on{background:#000}
-    /* content lists */
-    ul, ol{margin:8px 0 14px 20px}
-    li{margin:4px 0}
+    ul,ol{margin:8px 0 14px 20px} li{margin:4px 0}
     .section-title{font-weight:800;margin-top:10px}
     .divider{height:1px;background:#eee;margin:14px 0;border-radius:1px}
     .footer-note{font-size:13px;margin-top:2px}
-    .right{float:right}
-    @media (max-width:640px){ .right{float:none;display:block;margin-top:6px} }
+    .right{float:right} @media (max-width:640px){.right{float:none;display:block;margin-top:6px}}
   </style>
 </head>
 <body>
@@ -120,12 +90,10 @@
         <span class="right">Prefer a person? Call <b>+91-XXXXXXXXXX</b></span>
       </p>
 
-      <!-- hidden log (optional) -->
       <pre id="log" style="display:none"></pre>
     </section>
   </main>
 
-  <!-- ===== Voice logic ===== -->
   <script>
     const startBtn = document.getElementById('startBtn');
     const endBtn   = document.getElementById('endBtn');
@@ -139,13 +107,15 @@
     const SILENCE_MS = 15000;
     const RMS_THRESHOLD = 0.006;
 
+    const log = (...a)=>console.log(...a);
+
     function timeOfDay(){ const h=new Date().getHours(); return h<12?'morning':h<17?'afternoon':h<21?'evening':'night'; }
 
     async function startCall() {
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
       startBtn.disabled = true; endBtn.disabled = false;
 
-      // 1) Get ephemeral key from your backend
+      // 1) Get ephemeral key/model from your backend
       const resp = await fetch('/api/session');
       if (!resp.ok) {
         const err = await resp.json().catch(()=>({}));
@@ -156,54 +126,48 @@
       const EPHEMERAL = sess?.client_secret?.value;
       const MODEL = encodeURIComponent(sess?.model || 'gpt-4o-realtime-preview');
 
-      // 2) AudioContext must be resumed on user gesture (prevents autoplay blocks)
+      // 2) AudioContext (resume on user gesture)
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       if (ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
 
-      // 3) Create RTCPeerConnection and explicitly request to RECEIVE audio
+      // 3) PeerConnection; explicitly request to RECEIVE audio
       pc = new RTCPeerConnection({
         iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
+        // If behind strict NAT/firewall uncomment:
+        // iceTransportPolicy: 'relay'
       });
-      pc.addTransceiver('audio', { direction: 'sendrecv' }); // <-- critical for remote audio
-
-      // helpful logs
-      pc.oniceconnectionstatechange = () => console.log('ice:', pc.iceConnectionState);
-      pc.onconnectionstatechange   = () => console.log('pc:', pc.connectionState);
+      pc.addTransceiver('audio', { direction: 'sendrecv' }); // must be before createOffer
+      pc.oniceconnectionstatechange = () => log('ice:', pc.iceConnectionState);
+      pc.onconnectionstatechange   = () => log('pc:', pc.connectionState);
 
       // 4) Data channel for session control/events
       dc = pc.createDataChannel('oai-events');
-
       dc.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data);
           if (msg?.type?.includes?.('error') || msg?.level === 'error') console.error('OAI error:', msg);
-          else console.log('OAI:', msg?.type || msg);
-        } catch {
-          console.log('OAI raw:', e.data);
-        }
+          else log('OAI:', msg?.type || msg);
+        } catch { log('OAI raw:', e.data); }
       };
 
-      // 5) On open, configure the session so the model SPEAKS
       dc.onopen = () => {
-        // set voice + modalities + server VAD
+        // Configure the session to speak
         dc.send(JSON.stringify({
           type: 'session.update',
           session: {
             modalities: ['audio','text'],
-            voice: 'verse',                           // choose any available voice
+            voice: 'verse',
             turn_detection: { type: 'server_vad', silence_duration_ms: 500 }
           }
         }));
-
-        // friendly greeting
-        const greet = `Hi! Good ${timeOfDay()}. Which language would you like to talk in — English, Telugu, or Hindi?`;
+        // Optional greeting
         dc.send(JSON.stringify({
           type: 'response.create',
-          response: { modalities: ['audio'], instructions: greet }
+          response: { modalities: ['audio'], instructions: `Hi! Good ${timeOfDay()}. Which language would you like to talk in — English, Telugu, or Hindi?` }
         }));
       };
 
-      // 6) Get microphone and publish
+      // 5) Get microphone and publish
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
@@ -214,20 +178,25 @@
       }
       localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-      // 7) When model sends audio back, attach to <audio> and also mirror to recorder
+      // 6) Remote audio handling (robust to empty streams array)
       const dest = ctx.createMediaStreamDestination();
       pc.ontrack = (ev) => {
-        remoteStream = ev.streams[0];
+        log('ontrack fired');
+        const track = ev.track;
+        if (!remoteStream) {
+          remoteStream = ev.streams?.[0] || new MediaStream();
+          if (!ev.streams?.length) remoteStream.addTrack(track);
+        }
         aiAudio.srcObject = remoteStream;
         aiAudio.muted = false;
-        aiAudio.play().catch(()=>{}); // ensure playback after click gesture
+        aiAudio.play().catch(()=>{ /* iOS may need extra resume, but we already did */ });
 
-        // mix mic + ai to one stream for recording
+        // Mix mic+AI into recorder
         const micSrc = ctx.createMediaStreamSource(localStream);
         const aiSrc  = ctx.createMediaStreamSource(remoteStream);
         micSrc.connect(dest); aiSrc.connect(dest);
 
-        // LED + silence monitor (from mic)
+        // LED + silence from mic
         analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
         const micTap = ctx.createMediaStreamSource(localStream);
         micTap.connect(analyser);
@@ -253,33 +222,36 @@
         };
         setTimeout(()=>{ resetSilence(); monitor(); }, 1200);
 
+        // Recorder
         try { mediaRecorder = new MediaRecorder(dest.stream, { mimeType: 'audio/webm;codecs=opus' }); }
         catch { mediaRecorder = new MediaRecorder(dest.stream); }
         mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
         mediaRecorder.start(250);
+
+        // Force a one-line voice check (useful for confirming audio path)
+        try {
+          dc?.send(JSON.stringify({ type:'response.create', response:{ modalities:['audio'], instructions:'Voice check okay.' } }));
+        } catch {}
       };
 
-      // 8) Create SDP offer, wait for ICE gather, send to OpenAI, set answer
+      // 7) Create SDP, wait for ICE, send to OpenAI, set answer
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-
       await new Promise((resolve) => {
         if (pc.iceGatheringState === 'complete') return resolve();
         pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') resolve(); };
-        // safety timeout
         setTimeout(resolve, 1500);
       });
 
       const sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${MODEL}`, {
-  method: 'POST',
-  headers: {
-    'Authorization': `Bearer ${EPHEMERAL}`,
-    'Content-Type': 'application/sdp',
-    'OpenAI-Beta': 'realtime=v1'      // <-- IMPORTANT
-  },
-  body: pc.localDescription.sdp
-});
-
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${EPHEMERAL}`,
+          'Content-Type': 'application/sdp',
+          'OpenAI-Beta': 'realtime=v1'
+        },
+        body: pc.localDescription.sdp
+      });
 
       if (!sdpResp.ok) {
         const t = await sdpResp.text();
@@ -300,7 +272,6 @@
       try { pc && pc.close(); } catch {}
       try { localStream && localStream.getTracks().forEach(t => t.stop()); } catch {}
 
-      // upload the recording (optional)
       if (recordedChunks.length) {
         const audioBlob = new Blob(recordedChunks, { type: 'audio/webm' });
         const form = new FormData();
