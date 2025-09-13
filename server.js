@@ -1,102 +1,112 @@
 // /api/session.js
+// Node 18+ (global fetch). Serverless-friendly.
+
 export default async function handler(req, res) {
   try {
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ error: { message: 'OPENAI_API_KEY not set' } });
+    if (req.method !== 'GET') {
+      return res.status(405).json({ error: { message: 'Method not allowed' } });
     }
 
+    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ error: { message: 'OPENAI_API_KEY is not set' } });
+    }
+
+    const model = process.env.REALTIME_MODEL || 'gpt-4o-realtime-preview';
+    const voice = process.env.REALTIME_VOICE || 'verse';
+
+    // --- Your assistant script / behavior ---
     const INSTRUCTIONS = `
-You are "iiTuitions Admissions Assistant". Speak warmly, clearly, and BRIEFLY.
-Ask one question, then WAIT. Switch language if user asks (English / తెలుగు / हिन्दी).
+You are "iiTuitions Admissions Assistant". Speak warmly, clearly, and briefly.
+Ask one question, then WAIT for the parent to reply. Switch language if they ask
+(English / తెలుగు / हिन्दी). If you can't hear the user for ~10 seconds, apologise
+and end politely.
 
-1) CONSENT: Ask permission to record this short call for admission support. If no, politely end.
+Flow:
+1) Ask consent to record for admission support. If No → end.
+2) Quick triage (short questions, one at a time):
+   - Grade & JEE window
+   - Current school/coaching & weekly tests?
+   - Biggest frustration in last 30 days?
+   - P/C/M: concepts vs numericals (what’s harder?)
+   - Pace & stress (too slow/fast? rapid syllabus?)
+   - Discipline & doubts (how quickly are doubts cleared?)
+3) Reflect top pains in one short line each.
+4) Offer sample teach + assessment → personalised roadmap; ask to book today/tomorrow.
+5) Pricing guardrails (ranges only before assessment; after, compute from sessions/week × hours × pack discounts).
+6) Objections: reply in one line (price, already enrolled, online doubt, time).
+7) Close: confirm slot or propose two options; say WhatsApp confirmation will arrive.
 
-2) SIX TRIAGE QUESTIONS (fast):
-   Q1 Grade & JEE window.
-   Q2 Current school/coaching & weekly tests?
-   Q3 Biggest frustration in last 30 days?
-   Q4 P/C/M — concepts vs numericals (what hurts more)?
-   Q5 Pace & stress (too slow/fast? rapid syllabus stress?).
-   Q6 Discipline & doubts (how quickly are doubts cleared?).
-
-Mirror each pain in one short line.
-
-3) DETECT TOP 2–3 TAGS (only 2–3): PACE/BATCH, INTL, LOST11, NUM-PHY, NUM-CHE, NUM-MATH,
-   CONCEPT-PHY, CONCEPT-CHE, CONCEPT-MATH, DISCIPLINE, DOUBTS, BOARD, PANIC/DROPPER,
-   MISLED/2ND-OPN, COST.
-   Deliver <= 25s MICRO-PITCH tailored to those tags.
-
-4) ASSESSMENT PITCH (always):
-   Offer no-stress sample teach + assessment → personalised roadmap; ask to book a slot today/tomorrow.
-
-5) PRICING GUARDRAILS:
-   Before assessment → only per-hour ranges (Online: ₹800–1000 Mains; ₹1200–1400 Adv).
-   After assessment → monthly = sessions/week × hours × pack discounts.
-
-6) OBJECTIONS (one-liners):
-   Price / Already in Narayana/Chaitanya / Online won’t work / Time less → brief, positive.
-
-7) CLOSE:
-   If booked → confirm slot; say WhatsApp confirmation + checklist will arrive.
-   Else → offer two option slots to pick later. Wrap up politely.
-
-SILENCE (~10s):
-(EN) “Sorry, I can’t hear you. I’ll end this call now.”
-(TE) “క్షమించండి, నేను వినలేకపోతున్నాను. ఇప్పుడు కాల్ ముగిస్తున్నాను.”
-(HI) “माफ़ कीजिए, आपकी आवाज़ नहीं आ रही है। अब मैं कॉल समाप्त करता/करती हूँ।”
+Silence lines (~10s):
+EN: "Sorry, I can’t hear you. I’ll end this call now."
+TE: "క్షమించండి, నేను వినలేకపోతున్నాను. ఇప్పుడు కాల్ ముగిస్తున్నాను."
+HI: "माफ़ कीजिए, आपकी आवाज़ नहीं आ रही है। अब मैं कॉल समाप्त करता/करती हूँ।"
 `.trim();
 
-    // Create ephemeral OpenAI Realtime session
-    const oa = await fetch('https://api.openai.com/v1/realtime/sessions', {
+    // --- Create ephemeral OpenAI Realtime session ---
+    const oaResp = await fetch('https://api.openai.com/v1/realtime/sessions', {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
         'Content-Type': 'application/json',
         'OpenAI-Beta': 'realtime=v1',
       },
       body: JSON.stringify({
-        model: process.env.REALTIME_MODEL || 'gpt-4o-realtime-preview',
-        voice: process.env.REALTIME_VOICE || 'verse',
-        turn_detection: { type: 'server_vad', silence_duration_ms: 700 },
-        create_response: true,        // <-- server auto-replies after each utterance
+        model,
+        voice,
+        // Let the server auto-generate a reply after each user utterance.
+        create_response: true,
         interrupt_response: true,
-        output_audio_format: 'pcm16',
+        // Server VAD handles turn-taking.
+        turn_detection: { type: 'server_vad', silence_duration_ms: 700 },
+        // Realtime now requires audio+text (or text only) — never ['audio'] alone.
+        modalities: ['audio', 'text'],
         instructions: INSTRUCTIONS,
       }),
     });
-    const oaJson = await oa.json();
-    if (!oa.ok) return res.status(oa.status).json(oaJson);
 
-    // Optional TURN via Twilio (if env set)
+    const sessionJson = await oaResp.json();
+    if (!oaResp.ok) {
+      return res.status(oaResp.status).json(sessionJson);
+    }
+
+    // --- Optional: add TURN from Twilio to improve connectivity behind NAT ---
     let iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
-    const sid = process.env.TWILIO_ACCOUNT_SID;
-    const tok = process.env.TWILIO_AUTH_TOKEN;
 
-    if (sid && tok) {
-      const tw = await fetch(
-        `https://api.twilio.com/2010-04-01/Accounts/${sid}/Tokens.json`,
-        {
-          method: 'POST',
-          headers: {
-            Authorization: 'Basic ' + Buffer.from(`${sid}:${tok}`).toString('base64'),
-          },
+    const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+    const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN;
+
+    if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
+      try {
+        const twResp = await fetch(
+          `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Tokens.json`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization:
+                'Basic ' + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64'),
+            },
+          }
+        );
+        const twJson = await twResp.json();
+        if (twResp.ok && Array.isArray(twJson.ice_servers)) {
+          iceServers = twJson.ice_servers.map(s => ({
+            urls: s.urls ?? (s.url ? [s.url] : []),
+            username: s.username,
+            credential: s.credential,
+          }));
+        } else {
+          console.error('Twilio ICE token error:', twJson);
         }
-      );
-      const tj = await tw.json();
-      if (tw.ok && Array.isArray(tj.ice_servers)) {
-        iceServers = tj.ice_servers.map(s => ({
-          urls: s.urls ?? (s.url ? [s.url] : []),
-          username: s.username,
-          credential: s.credential,
-        }));
-      } else {
-        console.error('Twilio token error:', tj);
+      } catch (e) {
+        console.error('Twilio request failed:', e);
       }
     }
 
-    res.status(200).json({ ...oaJson, ice_servers: iceServers });
+    // Send session + ICE back to the client
+    res.status(200).json({ ...sessionJson, ice_servers: iceServers });
   } catch (err) {
-    console.error(err);
+    console.error('Session API error:', err);
     res.status(500).json({ error: { message: String(err?.message || err) } });
   }
 }
