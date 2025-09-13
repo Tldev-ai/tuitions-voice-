@@ -41,8 +41,6 @@
       </div>
 
       <div class="hint">On call. Speak normally. The assistant will reply.</div>
-
-      <!-- Hidden log (toggle by uncommenting display if you need debugging) -->
       <pre id="log"></pre>
     </section>
   </main>
@@ -54,21 +52,21 @@
   const aiAudio  = $('#aiAudio');
   const consent  = $('#consent');
   const led      = $('#led');
-  const logEl    = $('#log');
+  const logEl    = $('#log');  // keep hidden unless debugging
 
   let pc, dc, localStream, remoteStream, analyser, dataArray, silenceRAF;
+  let awaitingReply = false;   // prevent duplicate response.create
 
   const RMS_THRESHOLD = 0.006;
 
-  function log(...a){ /* show if you want */ /* logEl.style.display='block'; */ logEl.textContent += a.join(' ') + '\n'; logEl.scrollTop = logEl.scrollHeight; console.log(...a); }
-
+  function log(...a){ /* logEl.style.display='block'; */ logEl.textContent += a.join(' ') + '\n'; logEl.scrollTop = logEl.scrollHeight; console.log(...a); }
   function timeOfDay(){ const h=new Date().getHours(); return h<12?'morning':h<17?'afternoon':h<21?'evening':'night'; }
 
   async function startCall() {
     if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
     startBtn.disabled = true; endBtn.disabled = false;
 
-    // 1) Get ephemeral session (server creates Realtime session)
+    // 1) ephemeral session
     let sess;
     try{
       const r = await fetch('/api/session');
@@ -82,36 +80,56 @@
     const EPHEMERAL = sess?.client_secret?.value;
     const MODEL = encodeURIComponent(sess?.model || 'gpt-4o-realtime-preview-2024-12-17');
 
-    // 2) AudioContext & peer
+    // 2) audio + peer
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     if (ctx.state === 'suspended') { try{ await ctx.resume(); }catch{} }
 
     pc = new RTCPeerConnection({
       iceServers: [
         { urls: ['stun:stun.l.google.com:19302'] },
-        // If you configured a TURN, add it here:
-        // { urls: ['turn:YOUR_TURN_HOST:3478?transport=udp','turns:YOUR_TURN_HOST:5349?transport=tcp'], username: 'USER', credential: 'PASS' }
+        // Add your TURN here if needed:
+        // { urls: ['turn:YOUR_TURN_HOST:3478?transport=udp','turns:YOUR_TURN_HOST:5349?transport=tcp'], username:'USER', credential:'PASS' }
       ],
     });
 
-    // Must be added BEFORE createOffer so the answer includes a recv audio m-line
-    pc.addTransceiver('audio', { direction: 'sendrecv' });
+    // Request recv audio BEFORE offer
+    const remoteAudioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
 
     pc.oniceconnectionstatechange = () => log('ice:', pc.iceConnectionState);
     pc.onconnectionstatechange   = () => log('pc:', pc.connectionState);
 
-    // 3) Data channel: send session config + greeting when open
+    // Data channel for events
     dc = pc.createDataChannel('oai-events');
+
     dc.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data);
-        if (msg?.type?.includes?.('error') || msg?.level === 'error') console.error('OAI error:', msg);
-        else log('OAI:', msg?.type || msg);
+        if (msg?.type?.includes?.('error') || msg?.level === 'error') {
+          console.error('OAI error:', msg);
+          return;
+        }
+        // Drive the bot to SPEAK after each turn
+        if (msg?.type === 'input_audio_buffer.speech_stopped') {
+          if (!awaitingReply) {
+            awaitingReply = true;
+            dc.send(JSON.stringify({
+              type: 'response.create',
+              response: { modalities: ['audio','text'] }
+            }));
+          }
+        }
+        if (msg?.type === 'response.created') {
+          // a reply has started
+        }
+        if (msg?.type === 'response.done') {
+          awaitingReply = false;
+        }
+        log('OAI:', msg?.type || msg);
       } catch { log('OAI raw:', e.data); }
     };
 
     dc.onopen = () => {
-      // Ensure voice + VAD
+      // Make sure the session is set to speak
       dc.send(JSON.stringify({
         type: 'session.update',
         session: {
@@ -121,18 +139,16 @@
         }
       }));
 
-      // Spoken greeting so you always hear the first line
+      // Immediate spoken greeting
       const greet = `Hai. Good ${timeOfDay()}. Which language would you like to talk in — English, Telugu, or Hindi?`;
+      awaitingReply = true;
       dc.send(JSON.stringify({
         type: 'response.create',
-        response: {
-          modalities: ['audio','text'],
-          instructions: greet
-        }
+        response: { modalities: ['audio','text'], instructions: greet }
       }));
     };
 
-    // 4) Mic capture
+    // Mic
     try {
       localStream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
@@ -143,19 +159,22 @@
     }
     localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-    // 5) Remote audio playback + mic LED
+    // Remote audio wiring — attach when track actually gets data
     pc.ontrack = (ev) => {
+      const track = ev.track;
       if (!remoteStream) {
         remoteStream = ev.streams?.[0] || new MediaStream();
-        if (!ev.streams?.length) remoteStream.addTrack(ev.track);
+        if (!ev.streams?.length) remoteStream.addTrack(track);
         aiAudio.srcObject = remoteStream;
-        aiAudio.muted = false;
-        aiAudio.play().catch(()=>{}); // user gesture already happened
-        log('remote track unmuted (audio flowing)');
       }
+      track.onunmute = () => {
+        log('remote track unmuted (audio flowing)');
+        aiAudio.muted = false;
+        aiAudio.play().catch(()=>{});
+      };
     };
 
-    // LED monitor from mic
+    // Mic LED
     const analyserCtx = new (window.AudioContext || window.webkitAudioContext)();
     const micTap = analyserCtx.createMediaStreamSource(localStream);
     analyser = analyserCtx.createAnalyser(); analyser.fftSize = 2048;
@@ -170,11 +189,9 @@
     };
     monitor();
 
-    // 6) SDP offer/answer with OpenAI Realtime
+    // Offer/Answer
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-
-    // Wait for ICE to gather a bit
     await new Promise((resolve) => {
       if (pc.iceGatheringState === 'complete') return resolve();
       const to = setTimeout(resolve, 1500);
@@ -202,12 +219,9 @@
     }
 
     const answer = { type: 'answer', sdp: await sdpResp.text() };
-    if (pc.signalingState === 'stable') {
-      // Rare race: the PC got closed—avoid the InvalidStateError
-      console.warn('PC already stable/closed before setRemoteDescription.');
-      return;
+    if (pc.signalingState !== 'stable') {
+      await pc.setRemoteDescription(answer);
     }
-    await pc.setRemoteDescription(answer);
   }
 
   async function endCall() {
