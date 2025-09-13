@@ -1,78 +1,80 @@
 // /api/session.js
-// Creates an ephemeral Realtime session token and (optionally) returns ICE/TURN servers.
+// Vercel/Node 18+ (uses global fetch)
 
-export const config = { api: { bodyParser: false } };
+export default async function handler(req, res) {
+  if (req.method !== 'GET') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
 
-const MODEL = process.env.REALTIME_MODEL || "gpt-4o-realtime-preview";
-const VOICE = process.env.REALTIME_VOICE || "verse";
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    res.status(500).json({ error: 'Missing OPENAI_API_KEY' });
+    return;
+  }
 
-const PLAYBOOK = `
-You are "iiTuitions Admissions Assistant". Be warm and efficient.
-Speak only one question at a time; wait for the parent's reply.
+  const model = process.env.REALTIME_MODEL || 'gpt-4o-realtime-preview-2024-12-17';
+  const voice = process.env.REALTIME_VOICE || 'verse';
 
-Value:
-- 1-on-1 IIT/NIT alumni mentorship
-- Assessment → personalized roadmap
-- Daily WhatsApp updates, corrections every 15 days
-- Session recordings, Triple Guarantee, limited 50 intakes/year
+  // Short, strict “call flow” script (from your PDF condensed)
+  const instructions = `
+You are the "iiTuitions Admissions Assistant". Speak **warmly** and **briefly**.
+Rules:
+- Use natural pauses. Keep replies under 12 seconds.
+- Continue in the language the caller chooses (English, తెలుగు (Telugu), or हिन्दी (Hindi)).
+- Always wait for the parent to finish; use server VAD (no barge-in).
 
-Triage (sequential; one question each turn):
-1) Grade & exam window?
-2) Current school/coaching & weekly tests?
-3) Biggest 30-day frustration?
-4) Subject split (concept vs numericals) across Phy/Chem/Math?
-5) Pace & stress? (intl → fast pace)
-6) Discipline & doubts: are doubts cleared quickly?
+Call flow:
+1) Greet: "Hai. Good <morning/afternoon/evening>. Which language would you like to talk in — English, తెలుగు (Telugu), or हिन्दी (Hindi)?"
+2) Collect, one by one (one question at a time):
+   • Parent/Student name
+   • Grade & Board (CBSE/ICSE/State)
+   • Subjects and mode (Home tutoring or Online)
+   • Location (if home tutoring) OR confirm "Online"
+   • Preferred time to call back / demo slot
+   • Phone number
+   • Any budget range (optional)
+3) Fees: give a tight range only if asked; avoid long monologues.
+4) If demo requested, confirm a tentative slot.
+5) End: Short recap + "That’s all I need for now. I’ll end this call now."
 
-Pricing policy:
-- Before assessment: give only per-hour range; monthly only after assessment.
-- Don’t defame competitors.
-- Close: “Shall I book a 15-min assessment for you?”
-`.trim();
+If there is 10 seconds of silence, say:
+"Sorry, I’m not able to hear you. I’ll end this call now."
+Then stop speaking.
+  `.trim();
 
-export default async function handler(_req, res) {
   try {
-    const key = process.env.OPENAI_API_KEY;
-    if (!key) return res.status(500).json({ error: { message: "OPENAI_API_KEY missing" } });
-
-    // Create ephemeral session
-    const r = await fetch("https://api.openai.com/v1/realtime/sessions", {
-      method: "POST",
+    const r = await fetch('https://api.openai.com/v1/realtime/sessions', {
+      method: 'POST',
       headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'realtime=v1',
       },
       body: JSON.stringify({
-        model: MODEL,
-        voice: VOICE,
-        // Keep instructions short to fit session payload
-        instructions: PLAYBOOK,
-        // You can set output_audio_format if you like; default is fine.
+        model,
+        voice,
+        modalities: ['audio', 'text'],
+        // Tell the server to use its VAD for turns
+        turn_detection: { type: 'server_vad', silence_duration_ms: 700 },
+        // Keep these simple; the browser handles SDP codecs.
+        input_audio_format: 'pcm16',
+        output_audio_format: 'pcm16',
+        instructions,
       }),
     });
 
     const data = await r.json();
-    if (!r.ok) return res.status(r.status).json(data);
-
-    // Optional TURN (comma-separated URLs)
-    const turnUrls = (process.env.TURN_URLS || "")
-      .split(",")
-      .map(s => s.trim())
-      .filter(Boolean);
-
-    const iceServers = [
-      { urls: ["stun:stun.l.google.com:19302"] },
-      ...(turnUrls.length
-        ? [{ urls: turnUrls, username: process.env.TURN_USERNAME || "", credential: process.env.TURN_CREDENTIAL || "" }]
-        : []),
-    ];
-
-    return res.status(200).json({
-      model: MODEL,
-      client_secret: data.client_secret, // .value contains the ephemeral key
-      iceServers,
+    if (!r.ok) {
+      return res.status(r.status).json(data);
+    }
+    // Return the ephemeral client secret to the browser
+    res.status(200).json({
+      client_secret: data.client_secret,
+      model,
+      voice,
     });
   } catch (e) {
-    return res.status(500).json({ error: { message: e?.message || "Failed to create session" } });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 }
