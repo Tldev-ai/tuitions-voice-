@@ -1,239 +1,206 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>iiTuitions — Voice</title>
-<style>
-  :root{ --ink:#000; --ring:#e5e7eb; --idle:#bbb; }
-  *{box-sizing:border-box}
-  body{ margin:0; color:var(--ink); font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;
-        background:linear-gradient(180deg,#9EC3F2 0%,#DCE7F7 100%); min-height:100vh; }
-  .wrap{max-width:980px;margin:28px auto;padding:0 16px}
-  .card{padding:24px;border:1px solid var(--ring);border-radius:16px;box-shadow:0 6px 28px rgba(0,0,0,.06);background:#fff}
-  h1{margin:0 0 10px}
-  .row{display:flex;gap:12px;align-items:center;margin-top:12px;flex-wrap:wrap}
-  button{display:inline-flex;gap:8px;align-items:center;justify-content:center;padding:14px 36px;border-radius:999px;border:0;
-        background:#000;color:#fff;font-weight:800;cursor:pointer;letter-spacing:.2px;font-size:18px}
-  button:disabled{opacity:.6;cursor:not-allowed}
-  .dot{width:10px;height:10px;border-radius:999px;background:#bbb}
-  .dot.on{background:#0c0}
-  .consent{display:flex;align-items:center;gap:8px;margin-top:10px}
-  #log{display:none;white-space:pre;max-height:280px;overflow:auto;margin-top:12px;background:#fafafa;border:1px solid #eee;padding:8px;border-radius:8px}
-  .hint{opacity:.8;margin-top:8px}
-</style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>iiTuitions — Voice</title>
+  <style>
+    :root{ --ink:#000; --ring:#e5e7eb; --idle:#bbb; }
+    *{box-sizing:border-box}
+    body{
+      margin:0; color:var(--ink);
+      font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;
+      background:linear-gradient(180deg,#9EC3F2 0%,#DCE7F7 100%); min-height:100vh;
+    }
+    .wrap{max-width:980px;margin:28px auto;padding:0 16px}
+    .card{padding:24px;border:1px solid var(--ring);border-radius:16px;box-shadow:0 6px 28px rgba(0,0,0,.06);background:#fff}
+    h1{margin:0 0 10px} p{margin:0 0 14px}
+    .row{display:flex;gap:12px;align-items:center;margin-top:12px;flex-wrap:wrap}
+    button{
+      display:inline-flex;gap:8px;align-items:center;justify-content:center;
+      padding:12px 20px;border-radius:999px;border:0;background:#000;color:#fff;font-weight:800;cursor:pointer
+    }
+    button:disabled{opacity:.6;cursor:not-allowed}
+    .led{width:10px;height:10px;border-radius:999px;background:var(--idle)}
+    audio{display:none}
+    .bar{height:40px;border:1px solid #eee;border-radius:10px;display:flex;align-items:center;padding:0 12px;color:#444}
+    pre{height:320px;overflow:auto;background:#fafafa;border:1px solid #eee;padding:10px;border-radius:10px}
+    .dot{width:10px;height:10px;border-radius:999px;background:#bbb;display:inline-block}
+    .dot.on{background:#0a0}
+  </style>
 </head>
 <body>
   <main class="wrap">
     <section class="card">
       <h1>Talk to our Admissions Assistant</h1>
-
-      <label class="consent">
-        <input type="checkbox" id="consent" checked />
+      <label style="display:flex;gap:8px;align-items:center;margin:6px 0 12px">
+        <input type="checkbox" id="consent" checked>
         I agree to the recording and storage of this conversation.
       </label>
 
       <div class="row">
         <button id="startBtn">Start</button>
         <button id="endBtn" disabled>End</button>
-        <span id="led" class="dot" title="Mic activity"></span>
+        <span id="stateDot" class="dot" title="Connection state"></span>
         <audio id="aiAudio" autoplay playsinline></audio>
       </div>
 
-      <div class="hint">On call. Speak normally. The assistant will reply.</div>
+      <div id="status" class="bar" style="margin-top:12px">On call. Speak normally. The assistant will reply.</div>
+
       <pre id="log"></pre>
     </section>
   </main>
 
-<script>
-  const $ = s => document.querySelector(s);
-  const startBtn = $('#startBtn');
-  const endBtn   = $('#endBtn');
-  const aiAudio  = $('#aiAudio');
-  const consent  = $('#consent');
-  const led      = $('#led');
-  const logEl    = $('#log'); // set display:block if you want the inline log visible
+  <script>
+    const startBtn = document.getElementById('startBtn');
+    const endBtn   = document.getElementById('endBtn');
+    const statusEl = document.getElementById('status');
+    const logEl    = document.getElementById('log');
+    const aiAudio  = document.getElementById('aiAudio');
+    const consent  = document.getElementById('consent');
+    const dot      = document.getElementById('stateDot');
 
-  let pc, dc, localStream, remoteStream, analyser, dataArray, silenceRAF;
-  let awaitingReply = false;   // we asked the model to reply
-  let speaking = false;        // model is currently generating/streaming a reply
+    let pc, dc, localStream;
+    const println = (...a) => { console.log(...a); logEl.textContent += a.join(' ') + '\n'; logEl.scrollTop = logEl.scrollHeight; };
 
-  const RMS_THRESHOLD = 0.006;
+    function timeOfDay(){ const h=new Date().getHours(); return h<12?'morning':h<17?'afternoon':h<21?'evening':'night'; }
 
-  function log(...a){ /*logEl.style.display='block';*/ logEl.textContent += a.join(' ') + '\n'; logEl.scrollTop = logEl.scrollHeight; console.log(...a); }
-  function logErr(prefix, obj){ try{ console.error(prefix, obj?.error?.message || obj?.message || obj); }catch{ console.error(prefix, obj); } }
-  function timeOfDay(){ const h=new Date().getHours(); return h<12?'morning':h<17?'afternoon':h<21?'evening':'night'; }
+    async function startCall() {
+      if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
+      startBtn.disabled = true; endBtn.disabled = false; logEl.textContent = '';
 
-  async function startCall() {
-    if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
-    startBtn.disabled = true; endBtn.disabled = false;
+      // 1) Get ephemeral key + (optional) ICE/TURN from your backend
+      let sess;
+      try {
+        const resp = await fetch('/api/session');
+        if (!resp.ok) throw await resp.json();
+        sess = await resp.json();
+      } catch (e) {
+        alert('Failed to create session: ' + (e?.error?.message || e?.error || JSON.stringify(e)));
+        startBtn.disabled = false; endBtn.disabled = true; return;
+      }
+      const EPHEMERAL = sess?.client_secret?.value;
+      const MODEL     = encodeURIComponent(sess?.model || 'gpt-4o-realtime-preview');
+      const iceServers = sess?.iceServers || [{ urls: 'stun:stun.l.google.com:19302' }];
 
-    // 1) ephemeral session
-    let sess;
-    try{
-      const r = await fetch('/api/session');
-      if(!r.ok){ const e = await r.json().catch(()=>({})); throw new Error(e?.error?.message || JSON.stringify(e) || r.statusText); }
-      sess = await r.json();
-    }catch(err){
-      alert('Failed to create session:\n' + String(err?.message || err));
-      startBtn.disabled=false; endBtn.disabled=true; return;
-    }
+      // 2) Prepare audio context (autoplay constraints)
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      if (ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
 
-    const EPHEMERAL = sess?.client_secret?.value;
-    const MODEL = encodeURIComponent(sess?.model || 'gpt-4o-realtime-preview-2024-12-17');
+      // 3) Create RTCPeerConnection up front with recv+send audio
+      pc = new RTCPeerConnection({ iceServers });
+      pc.addTransceiver('audio', { direction: 'sendrecv' });
 
-    // 2) audio + peer
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    if (ctx.state === 'suspended') { try{ await ctx.resume(); }catch{} }
+      pc.oniceconnectionstatechange = () => {
+        println('ice:', pc.iceConnectionState);
+        dot.classList.toggle('on', pc.iceConnectionState === 'connected');
+      };
+      pc.onconnectionstatechange = () => println('pc:', pc.connectionState);
 
-    pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: ['stun:stun.l.google.com:19302'] },
-        // Add TURN here if one-way audio persists:
-        // { urls: ['turn:YOUR_TURN_HOST:3478?transport=udp','turns:YOUR_TURN_HOST:5349?transport=tcp'], username:'USER', credential:'PASS' }
-      ],
-    });
+      // 4) Data channel for events
+      dc = pc.createDataChannel('oai-events');
+      dc.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'response.created') statusEl.textContent = 'Thinking…';
+          if (msg.type === 'response.done')      statusEl.textContent = 'Listening…';
+          if (msg.type?.includes('error') || msg.level === 'error') {
+            println('OAI error:', msg); // show the object (don’t hide!!)
+          } else {
+            println('OAI:', msg.type || e.data);
+          }
+        } catch { println('OAI raw:', e.data); }
+      };
 
-    // Ask to receive audio BEFORE offer
-    pc.addTransceiver('audio', { direction: 'sendrecv' });
+      dc.onopen = () => {
+        // Send a greeting as audio+text. (Use ['audio','text']—this is the valid combo.)
+        const greet = `Hai. Good ${timeOfDay()}. Which language would you like—English, Telugu, or Hindi?`;
+        dc.send(JSON.stringify({
+          type: 'response.create',
+          response: { modalities: ['audio','text'], instructions: greet }
+        }));
+      };
 
-    pc.oniceconnectionstatechange = () => log('ice:', pc.iceConnectionState);
-    pc.onconnectionstatechange   = () => log('pc:', pc.connectionState);
+      // 5) Mic → publish
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
+        });
+      } catch {
+        alert('Microphone blocked. Click the mic icon in the address bar and Allow, then reload.');
+        startBtn.disabled = false; endBtn.disabled = true; return;
+      }
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-    // Data channel for events
-    dc = pc.createDataChannel('oai-events');
+      // 6) Remote audio → play
+      pc.ontrack = (ev) => {
+        const [stream] = ev.streams;
+        aiAudio.srcObject = stream;
+        ev.track.onunmute = () => {
+          println('remote track unmuted (audio flowing)');
+          aiAudio.play().catch(()=>{});
+        };
+      };
 
-    dc.onmessage = (e) => {
-      let msg;
-      try { msg = JSON.parse(e.data); } catch { log('OAI raw:', e.data); return; }
+      // 7) SDP offer/answer
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await new Promise((resolve) => {
+        if (pc.iceGatheringState === 'complete') return resolve();
+        pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') resolve(); };
+        setTimeout(resolve, 1500); // safety
+      });
 
-      // Print full error details so we see the cause in the console:
-      if (msg?.type === 'error' || msg?.level === 'error') { logErr('OAI error:', msg); return; }
+      const sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${MODEL}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${EPHEMERAL}`,
+          'Content-Type': 'application/sdp',
+          'OpenAI-Beta': 'realtime=v1'
+        },
+        body: pc.localDescription.sdp
+      });
 
-      // Drive the bot to SPEAK after each user turn
-      if (msg?.type === 'input_audio_buffer.speech_stopped') {
-        if (!awaitingReply && !speaking) {
-          awaitingReply = true;
-          dc.send(JSON.stringify({
-            type: 'response.create',
-            response: { modalities: ['audio','text'] }
-          }));
-        }
+      if (!sdpResp.ok) {
+        const t = await sdpResp.text();
+        println('Realtime SDP error:', t);
+        alert('Realtime connection failed (model/quota/region).');
+        await endCall();
+        return;
       }
 
-      if (msg?.type === 'response.created') { speaking = true; }
-      if (msg?.type === 'response.done')    { speaking = false; awaitingReply = false; }
+      const answer = { type: 'answer', sdp: await sdpResp.text() };
+      await pc.setRemoteDescription(answer);
 
-      log('OAI:', msg?.type);
-    };
-
-    dc.onopen = () => {
-      // Make sure the session is set to speak
-      dc.send(JSON.stringify({
+      // Tell the session to speak & auto-turn-take (also set on server, but sending once here is safe)
+      dc?.send(JSON.stringify({
         type: 'session.update',
         session: {
           modalities: ['audio','text'],
-          voice: sess?.voice || 'verse',
+          voice: 'verse',
           turn_detection: { type: 'server_vad', silence_duration_ms: 700 }
         }
       }));
 
-      // Immediate spoken greeting
-      const greet = `Hai. Good ${timeOfDay()}. Which language would you like to talk in — English, Telugu, or Hindi?`;
-      awaitingReply = true;
-      dc.send(JSON.stringify({
-        type: 'response.create',
-        response: { modalities: ['audio','text'], instructions: greet }
-      }));
-    };
-
-    // Get mic and publish
-    try {
-      localStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
-      });
-    } catch {
-      alert('Microphone blocked. Click the mic icon in the address bar and Allow, then reload.');
-      startBtn.disabled=false; endBtn.disabled=true; return;
-    }
-    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
-    // Remote audio wiring — play when track actually un-mutes
-    pc.ontrack = (ev) => {
-      const track = ev.track;
-      if (!remoteStream) {
-        remoteStream = ev.streams?.[0] || new MediaStream();
-        if (!ev.streams?.length) remoteStream.addTrack(track);
-        aiAudio.srcObject = remoteStream;
-      }
-      track.onunmute = () => {
-        log('remote track unmuted (audio flowing)');
-        aiAudio.muted = false;
-        aiAudio.play().catch(()=>{});
-      };
-    };
-
-    // Mic LED
-    const analyserCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const micTap = analyserCtx.createMediaStreamSource(localStream);
-    analyser = analyserCtx.createAnalyser(); analyser.fftSize = 2048;
-    micTap.connect(analyser);
-    dataArray = new Float32Array(analyser.fftSize);
-    const monitor = () => {
-      analyser.getFloatTimeDomainData(dataArray);
-      let rms = 0; for (let i=0;i<dataArray.length;i++){ const v=dataArray[i]; rms += v*v; }
-      rms = Math.sqrt(rms / dataArray.length);
-      led.classList.toggle('on', rms > RMS_THRESHOLD);
-      silenceRAF = requestAnimationFrame(monitor);
-    };
-    monitor();
-
-    // Offer/Answer
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await new Promise((resolve) => {
-      if (pc.iceGatheringState === 'complete') return resolve();
-      const to = setTimeout(resolve, 1500);
-      pc.onicegatheringstatechange = () => {
-        if (pc.iceGatheringState === 'complete') { clearTimeout(to); resolve(); }
-      };
-    });
-
-    const sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${MODEL}`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${EPHEMERAL}`,
-        'Content-Type': 'application/sdp',
-        'OpenAI-Beta': 'realtime=v1'
-      },
-      body: pc.localDescription.sdp
-    });
-
-    if (!sdpResp.ok) {
-      const t = await sdpResp.text();
-      console.error('Realtime SDP error:', t);
-      alert('Realtime connection failed. Check model/quota or ephemeral key.');
-      endCall();
-      return;
+      statusEl.textContent = 'Listening…';
     }
 
-    const answer = { type: 'answer', sdp: await sdpResp.text() };
-    if (pc.signalingState !== 'stable') {
-      await pc.setRemoteDescription(answer);
+    async function endCall() {
+      endBtn.disabled = true;
+      statusEl.textContent = 'Ending…';
+
+      try { pc && pc.close(); } catch {}
+      try { localStream && localStream.getTracks().forEach(t => t.stop()); } catch {}
+      pc = null; dc = null; localStream = null;
+      dot.classList.remove('on');
+
+      statusEl.textContent = 'Call ended.';
+      startBtn.disabled = false;
     }
-  }
 
-  async function endCall() {
-    endBtn.disabled = true;
-    try { if (silenceRAF) cancelAnimationFrame(silenceRAF); } catch {}
-    try { pc && pc.close(); } catch {}
-    try { localStream && localStream.getTracks().forEach(t => t.stop()); } catch {}
-    startBtn.disabled = false;
-  }
-
-  startBtn.addEventListener('click', startCall);
-  endBtn.addEventListener('click', endCall);
-  window.addEventListener('beforeunload', () => { try { pc && pc.close(); } catch {} });
-</script>
+    startBtn.addEventListener('click', startCall);
+    endBtn.addEventListener('click', endCall);
+    window.addEventListener('beforeunload', () => { try { pc && pc.close(); } catch {} });
+  </script>
 </body>
 </html>
