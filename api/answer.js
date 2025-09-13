@@ -1,12 +1,12 @@
-// /api/answer.js  — Next.js/Vercel API Route
-// Env required:  OPENAI_API_KEY
-// Optional:      TEXT_MODEL, TTS_MODEL, TTS_VOICE
+// /api/answer.js — Next.js/Vercel API Route
+// Env required: OPENAI_API_KEY
+// Optional: TEXT_MODEL, TTS_MODEL, TTS_VOICE
 
 export const config = { api: { bodyParser: true } };
 
 const TEXT_MODEL = process.env.TEXT_MODEL || "gpt-4o-mini";
-const TTS_MODEL  = process.env.TTS_MODEL  || "tts-1";       // <- stable TTS
-const TTS_VOICE  = process.env.TTS_VOICE  || "alloy";       // voices: alloy, verse, coral, etc.
+const TTS_MODEL  = process.env.TTS_MODEL  || "tts-1";
+const TTS_VOICE  = process.env.TTS_VOICE  || "alloy";
 
 const PLAYBOOK_SYSTEM = `
 You are "iiTuitions Admissions Assistant". Be warm, concise, and strictly conversational.
@@ -39,7 +39,6 @@ Policy:
 `.trim();
 
 function b64FromDataUrl(s) {
-  // Accept plain base64 or a data URL
   const m = /^data:audio\/[\w.+-]+;base64,(.+)$/i.exec(s || "");
   return m ? m[1] : s;
 }
@@ -55,7 +54,6 @@ async function oaFetch(url, opts, tries = 4, base = 350) {
     let body; try { body = await r.json(); } catch { body = await r.text(); }
     const msg = body?.error?.message || (typeof body === "string" ? body : JSON.stringify(body));
 
-    // retry only on 429 / 5xx
     if (r.status === 429 || r.status >= 500) {
       lastErr = msg;
       const backoff = base * Math.pow(2, i) + Math.random() * 120;
@@ -85,7 +83,7 @@ export default async function handler(req, res) {
 
     const { greet, audio, history = [] } = req.body || {};
 
-    // ===== GREETING =====
+    // GREETING
     if (greet) {
       try {
         const h = new Date().getHours();
@@ -103,16 +101,15 @@ To begin, may I know the student's grade and target exam window?`;
       }
     }
 
-    // ===== NORMAL TURN =====
+    // TURN
     if (!audio) return res.status(400).json({ error: { message: "Missing audio" }});
-
     const b64 = b64FromDataUrl(audio);
     const buf = Buffer.from(b64, "base64");
     if (buf.length > 8 * 1024 * 1024) {
       return res.status(413).json({ error: { message: "Audio too large (max ~8MB). Please speak shorter." }});
     }
 
-    // 1) Transcribe
+    // Transcribe
     const form = new FormData();
     form.append("file", new Blob([buf], { type: "audio/webm" }), "speech.webm");
     form.append("model", "whisper-1");
@@ -126,7 +123,7 @@ To begin, may I know the student's grade and target exam window?`;
     const userText = (tj.text || "").trim();
     if (!userText) return res.status(400).json({ error: { message: "Could not transcribe speech" }});
 
-    // 2) Chat
+    // Chat
     const messages = [
       { role: "system", content: PLAYBOOK_SYSTEM },
       ...history,
@@ -141,7 +138,7 @@ To begin, may I know the student's grade and target exam window?`;
     const reply = (cj.choices?.[0]?.message?.content || "").trim()
       || "Thanks. Could you please repeat that once more clearly?";
 
-    // 3) TTS
+    // TTS
     const audioUrl = await tts({ key, text: reply });
 
     return res.status(200).json({ ok: true, userText, reply, audio: audioUrl });
