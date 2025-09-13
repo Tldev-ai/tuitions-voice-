@@ -121,7 +121,7 @@
 
           // auto-turn: after your utterance ends, create a reply
           if (msg.type === 'input_audio_buffer.speech_stopped') {
-            dc.send(JSON.stringify({ type:'response.create', response:{ modalities:['audio'] } }));
+            dc.send(JSON.stringify({ type:'response.create', response:{ modalities:['audio','text'] } }));
           }
 
           if (msg.type === 'response.created' || msg.type === 'response.done') {
@@ -146,7 +146,7 @@
         const greet = `Hai. Good ${tod()}. May I record this short call for admission support? Which language would you like — English, తెలుగు (Telugu), or हिन्दी (Hindi)?`;
         const fireGreeting = () => dc.send(JSON.stringify({
           type: 'response.create',
-          response: { modalities:['audio'], instructions: greet }
+          response: { modalities:['audio','text'], instructions: greet }
         }));
 
         // fire immediately, retry once after 1s if nothing started
@@ -189,7 +189,7 @@
             try {
               dc?.send(JSON.stringify({
                 type:'response.create',
-                response:{ modalities:['audio'], instructions:"Sorry, I'm unable to hear you. I'll end this call now." }
+                response:{ modalities:['audio','text'], instructions:"Sorry, I'm unable to hear you. I'll end this call now." }
               }));
             } catch {}
           }, SILENCE_MS);
