@@ -52,14 +52,16 @@
   const aiAudio  = $('#aiAudio');
   const consent  = $('#consent');
   const led      = $('#led');
-  const logEl    = $('#log');  // keep hidden unless debugging
+  const logEl    = $('#log'); // set display:block if you want the inline log visible
 
   let pc, dc, localStream, remoteStream, analyser, dataArray, silenceRAF;
-  let awaitingReply = false;   // prevent duplicate response.create
+  let awaitingReply = false;   // we asked the model to reply
+  let speaking = false;        // model is currently generating/streaming a reply
 
   const RMS_THRESHOLD = 0.006;
 
-  function log(...a){ /* logEl.style.display='block'; */ logEl.textContent += a.join(' ') + '\n'; logEl.scrollTop = logEl.scrollHeight; console.log(...a); }
+  function log(...a){ /*logEl.style.display='block';*/ logEl.textContent += a.join(' ') + '\n'; logEl.scrollTop = logEl.scrollHeight; console.log(...a); }
+  function logErr(prefix, obj){ try{ console.error(prefix, obj?.error?.message || obj?.message || obj); }catch{ console.error(prefix, obj); } }
   function timeOfDay(){ const h=new Date().getHours(); return h<12?'morning':h<17?'afternoon':h<21?'evening':'night'; }
 
   async function startCall() {
@@ -87,13 +89,13 @@
     pc = new RTCPeerConnection({
       iceServers: [
         { urls: ['stun:stun.l.google.com:19302'] },
-        // Add your TURN here if needed:
+        // Add TURN here if one-way audio persists:
         // { urls: ['turn:YOUR_TURN_HOST:3478?transport=udp','turns:YOUR_TURN_HOST:5349?transport=tcp'], username:'USER', credential:'PASS' }
       ],
     });
 
-    // Request recv audio BEFORE offer
-    const remoteAudioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
+    // Ask to receive audio BEFORE offer
+    pc.addTransceiver('audio', { direction: 'sendrecv' });
 
     pc.oniceconnectionstatechange = () => log('ice:', pc.iceConnectionState);
     pc.onconnectionstatechange   = () => log('pc:', pc.connectionState);
@@ -102,30 +104,27 @@
     dc = pc.createDataChannel('oai-events');
 
     dc.onmessage = (e) => {
-      try {
-        const msg = JSON.parse(e.data);
-        if (msg?.type?.includes?.('error') || msg?.level === 'error') {
-          console.error('OAI error:', msg);
-          return;
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { log('OAI raw:', e.data); return; }
+
+      // Print full error details so we see the cause in the console:
+      if (msg?.type === 'error' || msg?.level === 'error') { logErr('OAI error:', msg); return; }
+
+      // Drive the bot to SPEAK after each user turn
+      if (msg?.type === 'input_audio_buffer.speech_stopped') {
+        if (!awaitingReply && !speaking) {
+          awaitingReply = true;
+          dc.send(JSON.stringify({
+            type: 'response.create',
+            response: { modalities: ['audio','text'] }
+          }));
         }
-        // Drive the bot to SPEAK after each turn
-        if (msg?.type === 'input_audio_buffer.speech_stopped') {
-          if (!awaitingReply) {
-            awaitingReply = true;
-            dc.send(JSON.stringify({
-              type: 'response.create',
-              response: { modalities: ['audio','text'] }
-            }));
-          }
-        }
-        if (msg?.type === 'response.created') {
-          // a reply has started
-        }
-        if (msg?.type === 'response.done') {
-          awaitingReply = false;
-        }
-        log('OAI:', msg?.type || msg);
-      } catch { log('OAI raw:', e.data); }
+      }
+
+      if (msg?.type === 'response.created') { speaking = true; }
+      if (msg?.type === 'response.done')    { speaking = false; awaitingReply = false; }
+
+      log('OAI:', msg?.type);
     };
 
     dc.onopen = () => {
@@ -148,7 +147,7 @@
       }));
     };
 
-    // Mic
+    // Get mic and publish
     try {
       localStream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
@@ -159,7 +158,7 @@
     }
     localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-    // Remote audio wiring — attach when track actually gets data
+    // Remote audio wiring — play when track actually un-mutes
     pc.ontrack = (ev) => {
       const track = ev.track;
       if (!remoteStream) {
