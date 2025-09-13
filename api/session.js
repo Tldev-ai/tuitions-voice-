@@ -1,5 +1,7 @@
 // /api/session.js
-// Node 18+ (global fetch). Works on Vercel/Next serverless.
+// Requires: OPENAI_API_KEY
+// Optional TURN: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
+// Optional: REALTIME_MODEL, REALTIME_VOICE
 
 export default async function handler(req, res) {
   try {
@@ -15,34 +17,13 @@ export default async function handler(req, res) {
     const model = process.env.REALTIME_MODEL || 'gpt-4o-realtime-preview';
     const voice = process.env.REALTIME_VOICE || 'verse';
 
-    const INSTRUCTIONS = `
+    const instructions = `
 You are "iiTuitions Admissions Assistant". Speak warmly, clearly, and briefly.
-Ask one question and WAIT for the parent to reply. Switch language if they ask
-(English / తెలుగు / हिन्दी). If you can't hear the user for ~10 seconds, apologise
-and end politely.
-
-Flow:
-1) Ask consent to record for admission support. If No → end.
-2) Quick triage (short questions, one at a time):
-   - Grade & JEE window
-   - Current school/coaching & weekly tests?
-   - Biggest frustration in last 30 days?
-   - P/C/M: concepts vs numericals (what’s harder?)
-   - Pace & stress (too slow/fast? rapid syllabus?)
-   - Discipline & doubts (how quickly are doubts cleared?)
-3) Reflect top pains in one short line each.
-4) Offer sample teach + assessment → personalised roadmap; ask to book today/tomorrow.
-5) Pricing guardrails (ranges only before assessment; after, compute from sessions/week × hours × pack discounts).
-6) Objections: reply in one line (price, already enrolled, online doubt, time).
-7) Close: confirm slot or propose two options; say WhatsApp confirmation will arrive.
-
-Silence lines (~10s):
-EN: "Sorry, I can’t hear you. I’ll end this call now."
-TE: "క్షమించండి, నేను వినలేకపోతున్నాను. ఇప్పుడు కాల్ ముగిస్తున్నాను."
-HI: "माफ़ कीजिए, आपकी आवाज़ नहीं आ रही है। अब मैं कॉल समाप्त करता/करती हूँ।"
+Ask one question and WAIT for the parent to reply. Handle English / తెలుగు / हिन्दी.
+If no reply for ~10s, apologise and end.
 `.trim();
 
-    // Create ephemeral OpenAI Realtime session
+    // NOTE: No create_response / interrupt_response here
     const oaResp = await fetch('https://api.openai.com/v1/realtime/sessions', {
       method: 'POST',
       headers: {
@@ -54,53 +35,50 @@ HI: "माफ़ कीजिए, आपकी आवाज़ नहीं आ
         model,
         voice,
         modalities: ['audio', 'text'],
-        create_response: true,          // server auto-turn replies
-        interrupt_response: true,
         turn_detection: { type: 'server_vad', silence_duration_ms: 700 },
-        instructions: INSTRUCTIONS,
+        instructions,
       }),
     });
 
     const sessionJson = await oaResp.json();
-    if (!oaResp.ok) return res.status(oaResp.status).json(sessionJson);
+    if (!oaResp.ok) {
+      return res.status(oaResp.status).json(sessionJson);
+    }
 
-    // Optional: add TURN from Twilio for NAT/firewall traversal
-    let iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
+    // --- ICE servers (STUN by default; add Twilio TURN if creds set) ---
+    let ice_servers = [{ urls: ['stun:stun.l.google.com:19302'] }];
 
-    const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
-    const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN;
-
-    if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
+    const sid = process.env.TWILIO_ACCOUNT_SID;
+    const tok = process.env.TWILIO_AUTH_TOKEN;
+    if (sid && tok) {
       try {
-        const twResp = await fetch(
-          `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Tokens.json`,
+        const r = await fetch(
+          `https://api.twilio.com/2010-04-01/Accounts/${sid}/Tokens.json`,
           {
             method: 'POST',
             headers: {
-              Authorization: 'Basic ' + Buffer.from(
-                `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
-              ).toString('base64'),
+              Authorization:
+                'Basic ' + Buffer.from(`${sid}:${tok}`).toString('base64'),
             },
           }
         );
-        const twJson = await twResp.json();
-        if (twResp.ok && Array.isArray(twJson.ice_servers)) {
-          iceServers = twJson.ice_servers.map(s => ({
+        const j = await r.json();
+        if (r.ok && Array.isArray(j.ice_servers)) {
+          ice_servers = j.ice_servers.map(s => ({
             urls: s.urls ?? (s.url ? [s.url] : []),
             username: s.username,
             credential: s.credential,
           }));
         } else {
-          console.error('Twilio ICE token error:', twJson);
+          console.error('Twilio ICE token error:', j);
         }
       } catch (e) {
-        console.error('Twilio request failed:', e);
+        console.error('Twilio ICE request failed:', e);
       }
     }
 
-    res.status(200).json({ ...sessionJson, ice_servers: iceServers });
+    res.status(200).json({ ...sessionJson, ice_servers });
   } catch (err) {
-    console.error('Session API error:', err);
     res.status(500).json({ error: { message: String(err?.message || err) } });
   }
 }
