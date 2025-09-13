@@ -114,7 +114,7 @@
 
       dc.onopen = () => {
         if (mySeq !== callSeq) return;
-        // (Server already has create_response: true)
+        // Server already has create_response: true
         dc.send(JSON.stringify({
           type: 'session.update',
           session: { modalities: ['audio','text'], voice: 'verse', turn_detection: { type:'server_vad', silence_duration_ms: 700 } }
@@ -143,14 +143,27 @@
       // Remote audio out (+ LED / silence)
       pc.ontrack = (ev) => {
         if (mySeq !== callSeq) return;
+
         const stream = ev.streams?.[0] || new MediaStream([ev.track]);
         if (!remoteStream) remoteStream = stream;
+
+        // 1) Try normal <audio> playback (and log if blocked)
         aiAudio.srcObject = remoteStream;
         aiAudio.muted = false;
         aiAudio.volume = 1.0;
-        aiAudio.play().catch(()=>{});
+        aiAudio.play().catch(err => console.warn('audio.play failed:', err));
+
+        // 2) ALWAYS route to WebAudio too → guarantees sound even if <audio> is blocked
+        try {
+          const remoteNode = ctx.createMediaStreamSource(remoteStream);
+          remoteNode.connect(ctx.destination);
+        } catch (e) {
+          console.warn('WebAudio connect failed:', e);
+        }
+
         ev.track.onunmute = () => log('remote track unmuted (audio flowing)');
 
+        // LED + silence detection from mic
         analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
         const micTap = ctx.createMediaStreamSource(localStream);
         dataArray = new Float32Array(analyser.fftSize);
