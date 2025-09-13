@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <meta http-equiv="Cache-Control" content="no-store" />
-  <title>iiTuitions — Voice (Push-to-Talk)</title>
+  <title>iiTuitions — Voice (Auto Turn-Taking)</title>
   <style>
     :root{ --ink:#000; --ring:#e5e7eb; --idle:#bbb; }
     *{box-sizing:border-box}
@@ -54,21 +54,12 @@
     let rec, chunks = [], recording = false, ctx, analyser, dataArray, raf, mediaStream;
     const RMS_THRESHOLD = 0.006, SILENCE_HANG_MS = 1200, MAX_MS = 12000;
     const history = [];
-    let inFlight = false, greeted = false;
+    let inFlight = false, greeted = false, autoLoop = true;
 
     function log(...a){ const s=a.map(x=>typeof x==='string'?x:JSON.stringify(x,null,2)).join(' '); logEl.textContent += s+'\n'; logEl.scrollTop = logEl.scrollHeight; }
-
-    function cancelSynth() {
-      try { speechSynthesis.cancel(); } catch {}
-    }
-    function stopAudio() {
-      try { aiAudio.pause(); aiAudio.currentTime = 0; aiAudio.removeAttribute('src'); aiAudio.load(); } catch {}
-    }
-    function resetUI() {
-      talkBtn.disabled = false;
-      talkBtn.textContent = '🎤 Start';
-      led.classList.remove('on');
-    }
+    function cancelSynth(){ try { speechSynthesis.cancel(); } catch {} }
+    function stopAudio(){ try { aiAudio.pause(); aiAudio.currentTime = 0; aiAudio.removeAttribute('src'); aiAudio.load(); } catch {} }
+    function resetUI(){ talkBtn.disabled = false; talkBtn.textContent = '🎤 Start'; led.classList.remove('on'); }
 
     talkBtn.addEventListener('click', () => {
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
@@ -78,7 +69,7 @@
     endBtn.addEventListener('click', endSession);
     window.addEventListener('beforeunload', endSession);
 
-    // ---- GREETING ----
+    // ===== GREETING =====
     async function playGreetingThenListen(){
       if (inFlight) return; inFlight = true;
       cancelSynth(); stopAudio();
@@ -95,7 +86,7 @@
 
         if (j.audio) {
           aiAudio.src = j.audio;
-          aiAudio.onended = () => { startRecording(); };
+          aiAudio.onended = () => { if (autoLoop) startRecording(); };
           await aiAudio.play().catch(()=>{});
           greeted = true;
         } else {
@@ -111,16 +102,16 @@ To begin, please tell me the student’s grade and target exam window.`;
         try {
           const utter = new SpeechSynthesisUtterance(fallbackText);
           utter.rate = 1; utter.pitch = 1; utter.lang = 'en-IN';
+          utter.onend = () => { if (autoLoop) startRecording(); };
           speechSynthesis.speak(utter);
         } catch {}
         greeted = true;
-        startRecording();
       } finally {
         inFlight = false; talkBtn.disabled = false; talkBtn.textContent = '🎙️ Start';
       }
     }
 
-    // ---- RECORDING ----
+    // ===== RECORDING =====
     async function startRecording(){
       if (recording || inFlight) return;
       cancelSynth(); stopAudio();
@@ -191,7 +182,7 @@ To begin, please tell me the student’s grade and target exam window.`;
       });
     }
 
-    // ---- SEND TO SERVER ----
+    // ===== SERVER TURN =====
     async function sendToServer(dataUrl){
       if (inFlight) return; inFlight = true;
       talkBtn.disabled = true; talkBtn.textContent = '⏳ Thinking…';
@@ -208,7 +199,12 @@ To begin, please tell me the student’s grade and target exam window.`;
           const j = await resp.json();
           if (j.userText) { history.push({ role:'user', content:j.userText }); log('You:', j.userText); }
           if (j.reply)    { history.push({ role:'assistant', content:j.reply }); log('AI:', j.reply); }
-          if (j.audio) { cancelSynth(); aiAudio.src = j.audio; aiAudio.play().catch(()=>{}); }
+          if (j.audio) {
+            cancelSynth();
+            aiAudio.src = j.audio;
+            aiAudio.onended = () => { if (autoLoop) startRecording(); };
+            aiAudio.play().catch(()=>{});
+          }
           ok = true;
         } else {
           let details = {};
@@ -221,16 +217,14 @@ To begin, please tell me the student’s grade and target exam window.`;
         }
       }
 
-      if (!ok) {
-        console.error('Answer error:', { message:lastError });
-        alert('Failed to get answer: ' + (lastError || 'unknown error'));
-      }
+      if (!ok) { console.error('Answer error:', { message:lastError }); alert('Failed to get answer: ' + (lastError || 'unknown error')); }
 
       inFlight = false; talkBtn.disabled = false; talkBtn.textContent = '🎤 Start';
     }
 
-    // ---- END/RESET ----
+    // ===== END/RESET =====
     function endSession() {
+      autoLoop = false;
       cancelSynth(); stopAudio();
       if (recording) stopRecording();
       try { mediaStream && mediaStream.getTracks().forEach(t=>t.stop()); } catch {}
@@ -239,6 +233,7 @@ To begin, please tell me the student’s grade and target exam window.`;
       greeted = false;
       resetUI();
       log('— session ended —');
+      setTimeout(()=>{ autoLoop = true; }, 300); // allow new session later
     }
   </script>
 </body>
