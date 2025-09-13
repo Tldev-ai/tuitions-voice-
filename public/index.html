@@ -72,7 +72,7 @@
       lastResponseAt = 0;
       const mySeq = ++callSeq;
 
-      // Session + ICE from backend
+      // Get ephemeral session + ICE (Twilio if configured)
       const sessResp = await fetch('/api/session', { cache: 'no-store' });
       if (!sessResp.ok) {
         const err = await sessResp.json().catch(()=>({}));
@@ -87,13 +87,13 @@
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       if (ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
 
-      // RTCPeerConnection
+      // RTCPeerConnection with ICE
       pc = new RTCPeerConnection({ iceServers /*, iceTransportPolicy:'relay'*/ });
       window.pc = pc;
       pc.oniceconnectionstatechange = () => log('ice:', pc.iceConnectionState);
       pc.onconnectionstatechange    = () => log('pc:', pc.connectionState);
 
-      // Single bidirectional transceiver
+      // Single audio transceiver (send & receive)
       const tx = pc.addTransceiver('audio', { direction: 'sendrecv' });
       try {
         const caps = RTCRtpReceiver.getCapabilities('audio');
@@ -101,7 +101,7 @@
         if (opus.length) tx.setCodecPreferences(opus);
       } catch {}
 
-      // DataChannel
+      // DataChannel for events
       dc = pc.createDataChannel('oai-events');
       dc.onmessage = (e) => {
         try {
@@ -114,12 +114,12 @@
 
       dc.onopen = () => {
         if (mySeq !== callSeq) return;
-        // We do NOT set create_response here (server already enabled)
+        // (Server already has create_response: true)
         dc.send(JSON.stringify({
           type: 'session.update',
           session: { modalities: ['audio','text'], voice: 'verse', turn_detection: { type:'server_vad', silence_duration_ms: 700 } }
         }));
-        // One-time greeting only
+        // One greeting only
         const greet = `Hai. Good ${tod()}. May I record this short call for admission support? Which language would you like — English, తెలుగు (Telugu), or हिन्दी (Hindi)?`;
         const fireGreeting = () => dc.send(JSON.stringify({
           type: 'response.create',
@@ -129,7 +129,7 @@
         setTimeout(() => { if (!lastResponseAt && dc?.readyState === 'open' && mySeq === callSeq) fireGreeting(); }, 1000);
       };
 
-      // Mic
+      // Mic in
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
@@ -140,7 +140,7 @@
       }
       tx.sender.replaceTrack(localStream.getAudioTracks()[0]);
 
-      // Remote audio + mic LED + silence timer
+      // Remote audio out (+ LED / silence)
       pc.ontrack = (ev) => {
         if (mySeq !== callSeq) return;
         const stream = ev.streams?.[0] || new MediaStream([ev.track]);
@@ -179,7 +179,7 @@
         setTimeout(()=>{ resetSilence(); monitor(); }, 800);
       };
 
-      // SDP exchange (race safe)
+      // SDP exchange (race-safe)
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       await new Promise((resolve) => {
