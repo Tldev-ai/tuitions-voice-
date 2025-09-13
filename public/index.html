@@ -58,7 +58,7 @@
     let pc, dc, localStream, remoteStream;
     let analyser, dataArray, silenceRAF, silenceTimer;
     let lastResponseAt = 0;
-    let callSeq = 0; // race guard for overlapping calls
+    let callSeq = 0;
 
     const SILENCE_MS = 15000, RMS_THRESHOLD = 0.006;
     const log = (...a)=>console.log(...a);
@@ -66,14 +66,13 @@
 
     async function startCall() {
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
-      // prevent double-start
       if (pc && (pc.connectionState === 'connecting' || pc.connectionState === 'connected')) return;
 
       startBtn.disabled = true; endBtn.disabled = false;
       lastResponseAt = 0;
       const mySeq = ++callSeq;
 
-      // 1) session + ICE from backend
+      // Session + ICE from backend
       const sessResp = await fetch('/api/session', { cache: 'no-store' });
       if (!sessResp.ok) {
         const err = await sessResp.json().catch(()=>({}));
@@ -88,17 +87,13 @@
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       if (ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
 
-      // 2) RTCPeerConnection with ICE (TURN)
-      pc = new RTCPeerConnection({
-        iceServers,
-        // iceTransportPolicy: 'relay', // enable while testing strict Wi-Fi
-      });
+      // RTCPeerConnection
+      pc = new RTCPeerConnection({ iceServers /*, iceTransportPolicy:'relay'*/ });
       window.pc = pc;
-
       pc.oniceconnectionstatechange = () => log('ice:', pc.iceConnectionState);
       pc.onconnectionstatechange    = () => log('pc:', pc.connectionState);
 
-      // 3) Bidirectional transceiver + prefer Opus
+      // Single bidirectional transceiver
       const tx = pc.addTransceiver('audio', { direction: 'sendrecv' });
       try {
         const caps = RTCRtpReceiver.getCapabilities('audio');
@@ -106,57 +101,35 @@
         if (opus.length) tx.setCodecPreferences(opus);
       } catch {}
 
-      // 4) DataChannel
+      // DataChannel
       dc = pc.createDataChannel('oai-events');
-
       dc.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data);
-          // verbose error printing
-          if (msg.type === 'error') {
-            console.error('OAI error:', msg.error || msg);
-          } else {
-            console.log('OAI:', msg.type || msg);
-          }
-
-          // auto-turn: after your utterance ends, create a reply
-          if (msg.type === 'input_audio_buffer.speech_stopped') {
-            dc.send(JSON.stringify({ type:'response.create', response:{ modalities:['audio','text'] } }));
-          }
-
-          if (msg.type === 'response.created' || msg.type === 'response.done') {
-            lastResponseAt = Date.now();
-          }
-        } catch {
-          console.log('OAI raw:', e.data);
-        }
+          if (msg.type === 'error') console.error('OAI error:', msg.error || msg);
+          else console.log('OAI:', msg.type || msg);
+          if (msg.type === 'response.created' || msg.type === 'response.done') lastResponseAt = Date.now();
+        } catch { console.log('OAI raw:', e.data); }
       };
 
       dc.onopen = () => {
-        if (mySeq !== callSeq) return; // stale call
+        if (mySeq !== callSeq) return;
+        // We do NOT set create_response here (server already enabled)
         dc.send(JSON.stringify({
           type: 'session.update',
-          session: {
-            modalities: ['audio','text'],
-            voice: 'verse',
-            turn_detection: { type: 'server_vad', silence_duration_ms: 700 }
-          }
+          session: { modalities: ['audio','text'], voice: 'verse', turn_detection: { type:'server_vad', silence_duration_ms: 700 } }
         }));
-
+        // One-time greeting only
         const greet = `Hai. Good ${tod()}. May I record this short call for admission support? Which language would you like — English, తెలుగు (Telugu), or हिन्दी (Hindi)?`;
         const fireGreeting = () => dc.send(JSON.stringify({
           type: 'response.create',
           response: { modalities:['audio','text'], instructions: greet }
         }));
-
-        // fire immediately, retry once after 1s if nothing started
         fireGreeting();
-        setTimeout(() => {
-          if (!lastResponseAt && dc?.readyState === 'open' && mySeq === callSeq) fireGreeting();
-        }, 1000);
+        setTimeout(() => { if (!lastResponseAt && dc?.readyState === 'open' && mySeq === callSeq) fireGreeting(); }, 1000);
       };
 
-      // 5) Mic publish via replaceTrack
+      // Mic
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
@@ -167,7 +140,7 @@
       }
       tx.sender.replaceTrack(localStream.getAudioTracks()[0]);
 
-      // 6) Remote audio + silence monitor
+      // Remote audio + mic LED + silence timer
       pc.ontrack = (ev) => {
         if (mySeq !== callSeq) return;
         const stream = ev.streams?.[0] || new MediaStream([ev.track]);
@@ -206,14 +179,9 @@
         setTimeout(()=>{ resetSilence(); monitor(); }, 800);
       };
 
-      // 7) SDP with OpenAI — race-safe
+      // SDP exchange (race safe)
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      // ensure we actually have a local offer
-      if (pc.signalingState !== 'have-local-offer') {
-        console.warn('Unexpected signalingState after setLocalDescription:', pc.signalingState);
-      }
-
       await new Promise((resolve) => {
         if (pc.iceGatheringState === 'complete') return resolve();
         pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') resolve(); };
@@ -237,9 +205,7 @@
       }
 
       const sdpText = await sdpResp.text();
-      if (mySeq !== callSeq) return; // stale answer
-
-      // only set the answer if we're still waiting for it
+      if (mySeq !== callSeq) return;
       if (pc.signalingState === 'have-local-offer') {
         await pc.setRemoteDescription({ type: 'answer', sdp: sdpText });
       } else {
@@ -249,7 +215,7 @@
 
     async function endCall() {
       endBtn.disabled = true;
-      callSeq++; // invalidate any in-flight answers
+      callSeq++;
       try { if (silenceTimer) clearTimeout(silenceTimer); if (silenceRAF) cancelAnimationFrame(silenceRAF); } catch {}
       try { pc && pc.close(); } catch {}
       try { localStream && localStream.getTracks().forEach(t => t.stop()); } catch {}
