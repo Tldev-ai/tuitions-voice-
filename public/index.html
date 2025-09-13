@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <meta http-equiv="Cache-Control" content="no-store" />
-  <title>iiTuitions — Voice (HTTP)</title>
+  <title>iiTuitions — Voice (Push-to-Talk)</title>
   <style>
     :root{ --ink:#000; --ring:#e5e7eb; --idle:#bbb; }
     *{box-sizing:border-box}
@@ -14,11 +14,11 @@
     .card{padding:24px;border:1px solid var(--ring);border-radius:16px;box-shadow:0 6px 28px rgba(0,0,0,.06);background:#fff}
     h1{margin:0 0 10px}
     .row{display:flex;gap:12px;align-items:center;margin-top:12px;flex-wrap:wrap}
-    button{display:inline-flex;gap:8px;align-items:center;justify-content:center;padding:12px 16px;border-radius:999px;border:0;background:#000;color:#fff;font-weight:800;cursor:pointer}
+    button{display:inline-flex;gap:8px;align-items:center;justify-content:center;padding:14px 22px;border-radius:999px;border:0;background:#000;color:#fff;font-weight:800;cursor:pointer}
     #talkBtn{min-width:260px}
     .led{width:10px;height:10px;border-radius:999px;background:var(--idle);box-shadow:0 0 0 1px #0001}
     .led.on{background:#000}
-    #log{font:12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; background:#fafafa; border:1px solid #eee; padding:10px; border-radius:10px; max-height:240px; overflow:auto}
+    #log{font:12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; background:#fafafa; border:1px solid #eee; padding:10px; border-radius:10px; max-height:240px; overflow:auto; margin-top:12px}
   </style>
 </head>
 <body>
@@ -32,7 +32,7 @@
       </label>
 
       <div class="row">
-        <button id="talkBtn">🎙️ Start</button>
+        <button id="talkBtn">🤖 Greeting…</button>
         <span class="led" id="led" title="Mic activity"></span>
         <audio id="aiAudio" autoplay playsinline></audio>
       </div>
@@ -56,32 +56,57 @@
 
     function log(...a){ const s=a.map(x=>typeof x==='string'?x:JSON.stringify(x,null,2)).join(' '); logEl.textContent += s+'\n'; logEl.scrollTop = logEl.scrollHeight; }
 
-    // --- GREETING: speak first, then start listening ---
-    async function playGreetingAndListen() {
-      if (inFlight) return;
-      inFlight = true; talkBtn.disabled = true; talkBtn.textContent = '🤖 Greeting…';
-      const r = await fetch('/api/answer', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ greet: true })
-      });
-      const j = await r.json().catch(()=>({}));
-      if (r.ok && j?.audio) {
-        history.push({ role:'assistant', content: j.reply || '' });
-        aiAudio.src = j.audio;
-        aiAudio.onended = () => { startRecording(); };
-        aiAudio.play().catch(()=>{ startRecording(); });
-        log('AI:', j.reply || '(greeting)');
-        greeted = true;
-      } else {
+    talkBtn.addEventListener('click', () => {
+      if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
+      if (!greeted) { playGreetingThenListen(); return; }
+      if (recording) stopRecording(); else startRecording();
+    });
+
+    // ---- GREETING ----
+    async function playGreetingThenListen(){
+      if (inFlight) return; inFlight = true;
+      talkBtn.disabled = true; talkBtn.textContent = '🤖 Greeting…';
+      try {
+        const r = await fetch('/api/answer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ greet: true })
+        });
+        const j = await r.json().catch(()=>({}));
+        if (!r.ok) throw new Error(j?.error?.message || `HTTP ${r.status}`);
+        if (j.reply) log('AI:', j.reply);
+
+        if (j.audio) {
+          aiAudio.src = j.audio;
+          aiAudio.onended = () => { startRecording(); };
+          await aiAudio.play().catch(()=>{});
+          greeted = true;
+        } else {
+          throw new Error('No audio from server');
+        }
+      } catch (e) {
+        // Fallback 1: use browser TTS so we ALWAYS speak first
+        console.warn('Greeting TTS failed:', e?.message || e);
         alert('Failed to play greeting. You can still talk; I will reply.');
+        const fallbackText =
+`Hai! This is iiTuitions admissions assistant.
+Which language would you like — English, Telugu, or Hindi?
+To begin, please tell me the student’s grade and target exam window.`;
+        try {
+          // Web Speech API
+          const utter = new SpeechSynthesisUtterance(fallbackText);
+          utter.rate = 1; utter.pitch = 1; utter.lang = 'en-IN';
+          speechSynthesis.speak(utter);
+        } catch {}
+        greeted = true;
         startRecording();
+      } finally {
+        inFlight = false; talkBtn.disabled = false; talkBtn.textContent = '🎙️ Start';
       }
-      inFlight = false; talkBtn.disabled = false; talkBtn.textContent = '⏹️ Stop (auto on silence)';
     }
 
+    // ---- RECORDING ----
     async function startRecording(){
-      if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
       if (recording || inFlight) return;
 
       try {
@@ -150,9 +175,10 @@
       });
     }
 
+    // ---- SEND TO SERVER ----
     async function sendToServer(dataUrl){
-      if (inFlight) return;
-      inFlight = true; talkBtn.disabled = true; talkBtn.textContent = '⏳ Thinking…';
+      if (inFlight) return; inFlight = true;
+      talkBtn.disabled = true; talkBtn.textContent = '⏳ Thinking…';
 
       let attempts = 0, ok = false, lastError = null;
       while (attempts < 3 && !ok) {
@@ -168,7 +194,6 @@
           if (j.reply)    { history.push({ role:'assistant', content:j.reply }); log('AI:', j.reply); }
           if (j.audio) { aiAudio.src = j.audio; aiAudio.play().catch(()=>{}); }
           ok = true;
-          break;
         } else {
           let details = {};
           try { details = await resp.json(); } catch {}
@@ -176,28 +201,17 @@
           if (resp.status === 429 || resp.status >= 500) {
             const backoff = 400 * Math.pow(2, attempts-1) + Math.random()*120;
             await new Promise(r => setTimeout(r, backoff));
-            continue;
-          } else {
-            break;
-          }
+          } else break;
         }
       }
 
       if (!ok) {
         console.error('Answer error:', { message:lastError });
-        alert(lastError?.includes('quota') || lastError?.includes('Rate limit')
-          ? 'We are being rate limited. Please wait a few seconds and try again.'
-          : 'Failed to get answer: ' + (lastError || 'unknown error'));
+        alert('Failed to get answer: ' + (lastError || 'unknown error'));
       }
 
       inFlight = false; talkBtn.disabled = false; talkBtn.textContent = '🎙️ Start';
     }
-
-    talkBtn.addEventListener('click', () => {
-      if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
-      if (!greeted) { playGreetingAndListen(); return; }
-      if (recording) stopRecording(); else startRecording();
-    });
   </script>
 </body>
 </html>
