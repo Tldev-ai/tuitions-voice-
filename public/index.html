@@ -57,22 +57,18 @@
 
     let pc, dc, localStream, remoteStream;
     let analyser, dataArray, silenceRAF, silenceTimer;
-    let lastResponseAt = 0;
     let callSeq = 0;
 
     const SILENCE_MS = 15000, RMS_THRESHOLD = 0.006;
-    const log = (...a)=>console.log(...a);
     const tod = ()=>{ const h=new Date().getHours(); return h<12?'morning':h<17?'afternoon':h<21?'evening':'night'; };
+    const log = (...a)=>console.log(...a);
 
     async function startCall() {
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
-      if (pc && (pc.connectionState === 'connecting' || pc.connectionState === 'connected')) return;
-
       startBtn.disabled = true; endBtn.disabled = false;
-      lastResponseAt = 0;
       const mySeq = ++callSeq;
 
-      // Get ephemeral session + ICE (Twilio if configured)
+      // 1) Create ephemeral session (and receive ICE servers)
       const sessResp = await fetch('/api/session', { cache: 'no-store' });
       if (!sessResp.ok) {
         const err = await sessResp.json().catch(()=>({}));
@@ -84,89 +80,92 @@
       const MODEL = encodeURIComponent(sess?.model || 'gpt-4o-realtime-preview');
       const iceServers = sess?.ice_servers || [{ urls: ['stun:stun.l.google.com:19302'] }];
 
+      // 2) Audio context (resume on user gesture)
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       if (ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
 
-      // RTCPeerConnection with ICE
+      // 3) PeerConnection
       pc = new RTCPeerConnection({ iceServers /*, iceTransportPolicy:'relay'*/ });
       window.pc = pc;
       pc.oniceconnectionstatechange = () => log('ice:', pc.iceConnectionState);
       pc.onconnectionstatechange    = () => log('pc:', pc.connectionState);
 
-      // Single audio transceiver (send & receive)
-      const tx = pc.addTransceiver('audio', { direction: 'sendrecv' });
-      try {
-        const caps = RTCRtpReceiver.getCapabilities('audio');
-        const opus = caps.codecs.filter(c=>c.mimeType.toLowerCase()==='audio/opus');
-        if (opus.length) tx.setCodecPreferences(opus);
-      } catch {}
-
-      // DataChannel for events
+      // 4) DataChannel for events
       dc = pc.createDataChannel('oai-events');
       dc.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data);
-          if (msg.type === 'error') console.error('OAI error:', msg.error || msg);
-          else console.log('OAI:', msg.type || msg);
-          if (msg.type === 'response.created' || msg.type === 'response.done') lastResponseAt = Date.now();
+          console.log('OAI:', msg.type || msg);
+
+          // After server-VAD says speech stopped, ask model to respond
+          if (msg.type === 'input_audio_buffer.speech_stopped') {
+            maybeAskForResponse();
+          }
+
+          // If we see the user utterance committed into the conversation, also trigger
+          if (msg.type === 'conversation.item.created' && msg.item?.role === 'user') {
+            maybeAskForResponse();
+          }
         } catch { console.log('OAI raw:', e.data); }
       };
 
+      let requested = false;
+      const maybeAskForResponse = () => {
+        if (!dc || dc.readyState !== 'open') return;
+        // Rate-limit double-fires from both events above
+        if (requested) return; requested = true;
+        dc.send(JSON.stringify({
+          type: 'response.create',
+          response: { modalities: ['audio','text'] }
+        }));
+        setTimeout(()=>{ requested = false; }, 400); // small window to avoid duplicates
+      };
+
       dc.onopen = () => {
-        if (mySeq !== callSeq) return;
-        // Server already has create_response: true
+        // Optional session.update (voice/modality)
         dc.send(JSON.stringify({
           type: 'session.update',
           session: { modalities: ['audio','text'], voice: 'verse', turn_detection: { type:'server_vad', silence_duration_ms: 700 } }
         }));
-        // One greeting only
-        const greet = `Hai. Good ${tod()}. May I record this short call for admission support? Which language would you like — English, తెలుగు (Telugu), or हिन्दी (Hindi)?`;
-        const fireGreeting = () => dc.send(JSON.stringify({
+        // First greeting
+        dc.send(JSON.stringify({
           type: 'response.create',
-          response: { modalities:['audio','text'], instructions: greet }
+          response: { modalities:['audio','text'], instructions: `Hai. Good ${tod()}. May I record this short call for admission support? Which language would you like — English, తెలుగు (Telugu), or हिन्दी (Hindi)?` }
         }));
-        fireGreeting();
-        setTimeout(() => { if (!lastResponseAt && dc?.readyState === 'open' && mySeq === callSeq) fireGreeting(); }, 1000);
       };
 
-      // Mic in
+      // 5) Mic → send
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
         });
       } catch {
-        alert('Microphone blocked. Click Allow, then reload.');
+        alert('Microphone blocked. Click Allow and reload.');
         startBtn.disabled=false; endBtn.disabled=true; return;
       }
-      tx.sender.replaceTrack(localStream.getAudioTracks()[0]);
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-      // Remote audio out (+ LED / silence)
+      // 6) Remote audio → play (via <audio> AND WebAudio to bypass autoplay blocks)
       pc.ontrack = (ev) => {
-        if (mySeq !== callSeq) return;
-
         const stream = ev.streams?.[0] || new MediaStream([ev.track]);
         if (!remoteStream) remoteStream = stream;
 
-        // 1) Try normal <audio> playback (and log if blocked)
         aiAudio.srcObject = remoteStream;
         aiAudio.muted = false;
         aiAudio.volume = 1.0;
         aiAudio.play().catch(err => console.warn('audio.play failed:', err));
 
-        // 2) ALWAYS route to WebAudio too → guarantees sound even if <audio> is blocked
         try {
           const remoteNode = ctx.createMediaStreamSource(remoteStream);
-          remoteNode.connect(ctx.destination);
-        } catch (e) {
-          console.warn('WebAudio connect failed:', e);
-        }
+          remoteNode.connect(ctx.destination); // <- guaranteed audible path
+        } catch (e) { console.warn('WebAudio connect failed:', e); }
 
         ev.track.onunmute = () => log('remote track unmuted (audio flowing)');
 
-        // LED + silence detection from mic
-        analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
+        // LED + silence from mic (optional)
+        const analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
         const micTap = ctx.createMediaStreamSource(localStream);
-        dataArray = new Float32Array(analyser.fftSize);
+        const dataArray = new Float32Array(analyser.fftSize);
         micTap.connect(analyser);
 
         const resetSilence = () => {
@@ -192,7 +191,7 @@
         setTimeout(()=>{ resetSilence(); monitor(); }, 800);
       };
 
-      // SDP exchange (race-safe)
+      // 7) SDP offer/answer with OpenAI
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       await new Promise((resolve) => {
@@ -213,7 +212,7 @@
 
       if (!sdpResp.ok) {
         console.error('Realtime SDP error:', await sdpResp.text());
-        alert('Realtime connection failed. Check model/quota or key.');
+        alert('Realtime connection failed (model/quota/key).');
         endCall(); return;
       }
 
@@ -234,6 +233,9 @@
       try { localStream && localStream.getTracks().forEach(t => t.stop()); } catch {}
       startBtn.disabled = false;
       led.classList.remove('on');
+
+      // optional: send your recording blob here – we stub the endpoint below
+      // await fetch('/api/upload', { method:'POST', body: formData })
     }
 
     startBtn.addEventListener('click', startCall);
