@@ -18,7 +18,7 @@
     #talkBtn{min-width:260px}
     .led{width:10px;height:10px;border-radius:999px;background:var(--idle);box-shadow:0 0 0 1px #0001}
     .led.on{background:#000}
-    #log{font:12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; background:#fafafa; border:1px solid #eee; padding:10px; border-radius:10px; max-height:200px; overflow:auto}
+    #log{font:12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; background:#fafafa; border:1px solid #eee; padding:10px; border-radius:10px; max-height:220px; overflow:auto}
   </style>
 </head>
 <body>
@@ -50,24 +50,21 @@
 
     let rec, chunks = [], recording = false, ctx, analyser, dataArray, raf, mediaStream;
     const RMS_THRESHOLD = 0.006, SILENCE_HANG_MS = 1200, MAX_MS = 12000;
-
-    const history = []; // [{role:'user'|'assistant', content:'...'}]
+    const history = [];
+    let inFlight = false; // prevent overlap
 
     function log(...a){ const s=a.map(x=>typeof x==='string'?x:JSON.stringify(x,null,2)).join(' '); logEl.textContent += s+'\n'; logEl.scrollTop = logEl.scrollHeight; }
 
     async function startRecording(){
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
-      if (recording) return;
+      if (recording || inFlight) return;
 
       try {
         mediaStream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
         });
-      } catch {
-        alert('Microphone blocked. Click Allow and reload.'); return;
-      }
+      } catch { alert('Microphone blocked. Click Allow and reload.'); return; }
 
-      // WebAudio for VAD
       ctx = new (window.AudioContext || window.webkitAudioContext)();
       if (ctx.state === 'suspended') await ctx.resume();
       const src = ctx.createMediaStreamSource(mediaStream);
@@ -75,26 +72,19 @@
       dataArray = new Float32Array(analyser.fftSize);
       src.connect(analyser);
 
-      // MediaRecorder for audio
-      try {
-        rec = new MediaRecorder(mediaStream, { mimeType:'audio/webm;codecs=opus' });
-      } catch {
-        rec = new MediaRecorder(mediaStream);
-      }
+      try { rec = new MediaRecorder(mediaStream, { mimeType:'audio/webm;codecs=opus' }); }
+      catch { rec = new MediaRecorder(mediaStream); }
       chunks = [];
       rec.ondataavailable = e => { if (e.data.size>0) chunks.push(e.data); };
       rec.onstop = onStop;
 
       rec.start(250);
       recording = true;
-      talkBtn.textContent = '⏹️ Stop (auto when silent)';
+      talkBtn.textContent = '⏹️ Stop (auto on silence)';
       led.classList.add('on');
       log('Listening…');
 
-      // auto-stop on silence or max duration
-      const startAt = Date.now();
-      let lastLoud = Date.now();
-
+      const startAt = Date.now(); let lastLoud = Date.now();
       const loop = () => {
         if (!recording) return;
         analyser.getFloatTimeDomainData(dataArray);
@@ -103,9 +93,7 @@
         if (rms > RMS_THRESHOLD) lastLoud = Date.now();
 
         const t = Date.now();
-        if (t - lastLoud > SILENCE_HANG_MS || t - startAt > MAX_MS) {
-          stopRecording(); return;
-        }
+        if (t - lastLoud > SILENCE_HANG_MS || t - startAt > MAX_MS) { stopRecording(); return; }
         raf = requestAnimationFrame(loop);
       };
       raf = requestAnimationFrame(loop);
@@ -124,7 +112,7 @@
 
     async function onStop(){
       const blob = new Blob(chunks, { type:'audio/webm' });
-      const b64 = await blobToDataURL(blob); // data:audio/webm;base64,....
+      const b64 = await blobToDataURL(blob);
       await sendToServer(b64);
     }
 
@@ -138,26 +126,49 @@
     }
 
     async function sendToServer(dataUrl){
-      log('Sending audio…');
-      const resp = await fetch('/api/answer', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ audio: dataUrl, history }),
-      });
-      const j = await resp.json().catch(()=>({}));
-      if (!resp.ok) {
-        console.error('Answer error:', j);
-        alert('Failed to get answer'); return;
+      if (inFlight) return;
+      inFlight = true;
+      talkBtn.disabled = true; talkBtn.textContent = '⏳ Thinking…';
+
+      // simple client retry if the API itself 429s
+      let attempts = 0, ok = false, lastError = null;
+      while (attempts < 3 && !ok) {
+        attempts++;
+        const resp = await fetch('/api/answer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ audio: dataUrl, history }),
+        });
+        if (resp.ok) {
+          const j = await resp.json();
+          if (j.userText) { history.push({ role:'user', content:j.userText }); log('You:', j.userText); }
+          if (j.reply)    { history.push({ role:'assistant', content:j.reply }); log('AI:', j.reply); }
+          if (j.audio) { aiAudio.src = j.audio; aiAudio.play().catch(()=>{}); }
+          ok = true;
+          break;
+        } else {
+          let details = {};
+          try { details = await resp.json(); } catch {}
+          lastError = details?.error?.message || `HTTP ${resp.status}`;
+          if (resp.status === 429 || resp.status >= 500) {
+            const backoff = 400 * Math.pow(2, attempts-1) + Math.random()*120;
+            await new Promise(r => setTimeout(r, backoff));
+            continue;
+          } else {
+            break;
+          }
+        }
       }
 
-      const { userText, reply, audio } = j;
-      if (userText) { history.push({ role:'user', content:userText }); log('You:', userText); }
-      if (reply)    { history.push({ role:'assistant', content:reply }); log('AI:', reply); }
-
-      if (audio) {
-        aiAudio.src = audio;
-        aiAudio.play().catch(err => console.warn('play failed:', err));
+      if (!ok) {
+        console.error('Answer error:', { message:lastError });
+        alert(lastError?.includes('quota') || lastError?.includes('Rate limit')
+          ? 'We are being rate limited. Please wait a few seconds and try again.'
+          : 'Failed to get answer: ' + (lastError || 'unknown error'));
       }
+
+      inFlight = false;
+      talkBtn.disabled = false; talkBtn.textContent = '🎙️ Start talking';
     }
 
     talkBtn.addEventListener('click', () => {
