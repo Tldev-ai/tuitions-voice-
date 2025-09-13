@@ -18,7 +18,7 @@
     #talkBtn{min-width:260px}
     .led{width:10px;height:10px;border-radius:999px;background:var(--idle);box-shadow:0 0 0 1px #0001}
     .led.on{background:#000}
-    #log{font:12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; background:#fafafa; border:1px solid #eee; padding:10px; border-radius:10px; max-height:220px; overflow:auto}
+    #log{font:12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; background:#fafafa; border:1px solid #eee; padding:10px; border-radius:10px; max-height:240px; overflow:auto}
   </style>
 </head>
 <body>
@@ -32,7 +32,7 @@
       </label>
 
       <div class="row">
-        <button id="talkBtn">🎙️ Start talking</button>
+        <button id="talkBtn">🎙️ Start</button>
         <span class="led" id="led" title="Mic activity"></span>
         <audio id="aiAudio" autoplay playsinline></audio>
       </div>
@@ -51,9 +51,34 @@
     let rec, chunks = [], recording = false, ctx, analyser, dataArray, raf, mediaStream;
     const RMS_THRESHOLD = 0.006, SILENCE_HANG_MS = 1200, MAX_MS = 12000;
     const history = [];
-    let inFlight = false; // prevent overlap
+    let inFlight = false;
+    let greeted = false;
 
     function log(...a){ const s=a.map(x=>typeof x==='string'?x:JSON.stringify(x,null,2)).join(' '); logEl.textContent += s+'\n'; logEl.scrollTop = logEl.scrollHeight; }
+
+    // --- GREETING: speak first, then start listening ---
+    async function playGreetingAndListen() {
+      if (inFlight) return;
+      inFlight = true; talkBtn.disabled = true; talkBtn.textContent = '🤖 Greeting…';
+      const r = await fetch('/api/answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ greet: true })
+      });
+      const j = await r.json().catch(()=>({}));
+      if (r.ok && j?.audio) {
+        history.push({ role:'assistant', content: j.reply || '' });
+        aiAudio.src = j.audio;
+        aiAudio.onended = () => { startRecording(); };
+        aiAudio.play().catch(()=>{ startRecording(); });
+        log('AI:', j.reply || '(greeting)');
+        greeted = true;
+      } else {
+        alert('Failed to play greeting. You can still talk; I will reply.');
+        startRecording();
+      }
+      inFlight = false; talkBtn.disabled = false; talkBtn.textContent = '⏹️ Stop (auto on silence)';
+    }
 
     async function startRecording(){
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
@@ -107,7 +132,7 @@
       try { if (raf) cancelAnimationFrame(raf); } catch {}
       try { ctx && ctx.close(); } catch {}
       led.classList.remove('on');
-      talkBtn.textContent = '🎙️ Start talking';
+      talkBtn.textContent = '🎙️ Start';
     }
 
     async function onStop(){
@@ -127,10 +152,8 @@
 
     async function sendToServer(dataUrl){
       if (inFlight) return;
-      inFlight = true;
-      talkBtn.disabled = true; talkBtn.textContent = '⏳ Thinking…';
+      inFlight = true; talkBtn.disabled = true; talkBtn.textContent = '⏳ Thinking…';
 
-      // simple client retry if the API itself 429s
       let attempts = 0, ok = false, lastError = null;
       while (attempts < 3 && !ok) {
         attempts++;
@@ -167,13 +190,13 @@
           : 'Failed to get answer: ' + (lastError || 'unknown error'));
       }
 
-      inFlight = false;
-      talkBtn.disabled = false; talkBtn.textContent = '🎙️ Start talking';
+      inFlight = false; talkBtn.disabled = false; talkBtn.textContent = '🎙️ Start';
     }
 
     talkBtn.addEventListener('click', () => {
-      if (recording) stopRecording();
-      else startRecording();
+      if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
+      if (!greeted) { playGreetingAndListen(); return; }
+      if (recording) stopRecording(); else startRecording();
     });
   </script>
 </body>
