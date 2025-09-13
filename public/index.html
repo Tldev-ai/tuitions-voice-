@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-store" />
   <title>iiTuitions — Voice</title>
   <style>
     :root{ --ink:#000; --ring:#e5e7eb; --idle:#bbb; }
@@ -57,6 +58,7 @@
     let pc, dc, localStream, remoteStream;
     let analyser, dataArray, silenceRAF, silenceTimer;
     let lastResponseAt = 0;
+    let callSeq = 0; // race guard for overlapping calls
 
     const SILENCE_MS = 15000, RMS_THRESHOLD = 0.006;
     const log = (...a)=>console.log(...a);
@@ -64,10 +66,15 @@
 
     async function startCall() {
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
+      // prevent double-start
+      if (pc && (pc.connectionState === 'connecting' || pc.connectionState === 'connected')) return;
+
       startBtn.disabled = true; endBtn.disabled = false;
+      lastResponseAt = 0;
+      const mySeq = ++callSeq;
 
       // 1) session + ICE from backend
-      const sessResp = await fetch('/api/session');
+      const sessResp = await fetch('/api/session', { cache: 'no-store' });
       if (!sessResp.ok) {
         const err = await sessResp.json().catch(()=>({}));
         alert('Failed to create session' + (err?.error?.message ? (':\n' + err.error.message) : ''));
@@ -78,19 +85,20 @@
       const MODEL = encodeURIComponent(sess?.model || 'gpt-4o-realtime-preview');
       const iceServers = sess?.ice_servers || [{ urls: ['stun:stun.l.google.com:19302'] }];
 
-      // 2) AudioContext
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       if (ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
 
-      // 3) RTCPeerConnection with ICE (TURN)
+      // 2) RTCPeerConnection with ICE (TURN)
       pc = new RTCPeerConnection({
         iceServers,
         // iceTransportPolicy: 'relay', // enable while testing strict Wi-Fi
       });
+      window.pc = pc;
+
       pc.oniceconnectionstatechange = () => log('ice:', pc.iceConnectionState);
       pc.onconnectionstatechange    = () => log('pc:', pc.connectionState);
 
-      // 4) One bidirectional transceiver + prefer Opus
+      // 3) Bidirectional transceiver + prefer Opus
       const tx = pc.addTransceiver('audio', { direction: 'sendrecv' });
       try {
         const caps = RTCRtpReceiver.getCapabilities('audio');
@@ -98,15 +106,20 @@
         if (opus.length) tx.setCodecPreferences(opus);
       } catch {}
 
-      // 5) DataChannel to drive responses
+      // 4) DataChannel
       dc = pc.createDataChannel('oai-events');
 
       dc.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data);
-          console.log('OAI:', msg.type || msg);
+          // verbose error printing
+          if (msg.type === 'error') {
+            console.error('OAI error:', msg.error || msg);
+          } else {
+            console.log('OAI:', msg.type || msg);
+          }
 
-          // after every user turn, ask the model to speak
+          // auto-turn: after your utterance ends, create a reply
           if (msg.type === 'input_audio_buffer.speech_stopped') {
             dc.send(JSON.stringify({ type:'response.create', response:{ modalities:['audio'] } }));
           }
@@ -120,7 +133,7 @@
       };
 
       dc.onopen = () => {
-        // configure session
+        if (mySeq !== callSeq) return; // stale call
         dc.send(JSON.stringify({
           type: 'session.update',
           session: {
@@ -130,19 +143,20 @@
           }
         }));
 
-        // reliable greeting (with 1s retry if nothing started)
         const greet = `Hai. Good ${tod()}. May I record this short call for admission support? Which language would you like — English, తెలుగు (Telugu), or हिन्दी (Hindi)?`;
-
         const fireGreeting = () => dc.send(JSON.stringify({
           type: 'response.create',
           response: { modalities:['audio'], instructions: greet }
         }));
 
+        // fire immediately, retry once after 1s if nothing started
         fireGreeting();
-        setTimeout(() => { if (!lastResponseAt && dc?.readyState === 'open') fireGreeting(); }, 1000);
+        setTimeout(() => {
+          if (!lastResponseAt && dc?.readyState === 'open' && mySeq === callSeq) fireGreeting();
+        }, 1000);
       };
 
-      // 6) Mic publish via replaceTrack
+      // 5) Mic publish via replaceTrack
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
@@ -153,12 +167,14 @@
       }
       tx.sender.replaceTrack(localStream.getAudioTracks()[0]);
 
-      // 7) Remote audio + silence monitor
+      // 6) Remote audio + silence monitor
       pc.ontrack = (ev) => {
+        if (mySeq !== callSeq) return;
         const stream = ev.streams?.[0] || new MediaStream([ev.track]);
         if (!remoteStream) remoteStream = stream;
         aiAudio.srcObject = remoteStream;
         aiAudio.muted = false;
+        aiAudio.volume = 1.0;
         aiAudio.play().catch(()=>{});
         ev.track.onunmute = () => log('remote track unmuted (audio flowing)');
 
@@ -190,9 +206,14 @@
         setTimeout(()=>{ resetSilence(); monitor(); }, 800);
       };
 
-      // 8) SDP with OpenAI
+      // 7) SDP with OpenAI — race-safe
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      // ensure we actually have a local offer
+      if (pc.signalingState !== 'have-local-offer') {
+        console.warn('Unexpected signalingState after setLocalDescription:', pc.signalingState);
+      }
+
       await new Promise((resolve) => {
         if (pc.iceGatheringState === 'complete') return resolve();
         pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') resolve(); };
@@ -215,12 +236,20 @@
         endCall(); return;
       }
 
-      const answer = { type: 'answer', sdp: await sdpResp.text() };
-      await pc.setRemoteDescription(answer);
+      const sdpText = await sdpResp.text();
+      if (mySeq !== callSeq) return; // stale answer
+
+      // only set the answer if we're still waiting for it
+      if (pc.signalingState === 'have-local-offer') {
+        await pc.setRemoteDescription({ type: 'answer', sdp: sdpText });
+      } else {
+        console.warn('Skipping setRemoteDescription; signalingState=', pc.signalingState);
+      }
     }
 
     async function endCall() {
       endBtn.disabled = true;
+      callSeq++; // invalidate any in-flight answers
       try { if (silenceTimer) clearTimeout(silenceTimer); if (silenceRAF) cancelAnimationFrame(silenceRAF); } catch {}
       try { pc && pc.close(); } catch {}
       try { localStream && localStream.getTracks().forEach(t => t.stop()); } catch {}
