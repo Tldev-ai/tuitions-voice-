@@ -1,58 +1,87 @@
 // /api/answer.js
-// Env needed: OPENAI_API_KEY
+// Env: OPENAI_API_KEY
 // Optional: TEXT_MODEL, TTS_MODEL, TTS_VOICE
-//
-// Client POSTs JSON: { audio: "data:audio/webm;base64,...", history: [{role, content}, ...] }
-// Returns: { ok:true, userText, reply, audio: "data:audio/mpeg;base64,..." }
 
 export const config = { api: { bodyParser: true } };
+
+const TEXT_MODEL = process.env.TEXT_MODEL || 'gpt-4o-mini';
+const TTS_MODEL  = process.env.TTS_MODEL  || 'tts-1';           // robust TTS model
+const TTS_VOICE  = process.env.TTS_VOICE  || 'verse';
+
+function b64FromDataUrl(s) {
+  const m = /^data:audio\/[\w.+-]+;base64,(.+)$/i.exec(s || '');
+  return m ? m[1] : s;
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// Generic OpenAI fetch with retries on 429/5xx
+async function oaFetch(url, opts, tries = 4, base = 350) {
+  let lastErr, lastStatus = 0;
+  for (let i = 0; i < tries; i++) {
+    const r = await fetch(url, opts);
+    lastStatus = r.status;
+    if (r.ok) return r;
+    let body;
+    try { body = await r.json(); } catch { body = await r.text(); }
+    // retry only on 429 or 5xx
+    if (r.status !== 429 && r.status < 500) {
+      const err = new Error((body?.error?.message) || JSON.stringify(body));
+      err.status = r.status;
+      throw err;
+    }
+    lastErr = (body?.error?.message) || JSON.stringify(body);
+    const jitter = Math.random() * 120;
+    await sleep(base * Math.pow(2, i) + jitter);
+  }
+  const e = new Error(lastErr || `OpenAI error (status ${lastStatus})`);
+  e.status = lastStatus || 429;
+  throw e;
+}
 
 export default async function handler(req, res) {
   try {
     if (req.method !== 'POST') {
       return res.status(405).json({ error: { message: 'Method not allowed' } });
     }
-
-    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ error: { message: 'OPENAI_API_KEY not set' } });
-    }
+    const key = process.env.OPENAI_API_KEY;
+    if (!key) return res.status(500).json({ error: { message: 'OPENAI_API_KEY not set' } });
 
     const { audio, history = [] } = req.body || {};
-    if (!audio || typeof audio !== 'string') {
-      return res.status(400).json({ error: { message: 'Missing audio data URL' } });
-    }
+    if (!audio) return res.status(400).json({ error: { message: 'Missing audio' } });
 
-    // ---- Decode base64 audio (data URL or raw base64) ----
-    const m = audio.match(/^data:audio\/[\w.+-]+;base64,(.+)$/);
-    const b64 = m ? m[1] : audio;
+    const b64 = b64FromDataUrl(audio);
     const buf = Buffer.from(b64, 'base64');
 
-    // ---- 1) Transcribe with Whisper ----
+    // Quick size guard (avoid huge clips hammering Whisper)
+    if (buf.length > 8 * 1024 * 1024) {
+      return res.status(413).json({ error: { message: 'Audio too large (limit ~8MB). Please speak shorter.' } });
+    }
+
+    // 1) Transcribe (Whisper)
     const form = new FormData();
     form.append('file', new Blob([buf], { type: 'audio/webm' }), 'speech.webm');
     form.append('model', 'whisper-1');
 
-    const tr = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    const tr = await oaFetch('https://api.openai.com/v1/audio/transcriptions', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: form,
+      headers: { Authorization: `Bearer ${key}` },
+      body: form
     });
+
     const tj = await tr.json();
-    if (!tr.ok) {
-      return res.status(tr.status).json(tj);
-    }
     const userText = (tj.text || '').trim();
     if (!userText) {
       return res.status(400).json({ error: { message: 'Could not transcribe speech' } });
     }
 
-    // ---- 2) Generate reply (Chat Completions) ----
+    // 2) Chat
     const systemPrompt = `
 You are "iiTuitions Admissions Assistant". Be warm, concise, and helpful.
 Support English / తెలుగు / हिन्दी — mirror the parent's language.
-Ask one question at a time, wait for the parent's next recording.
-If they ask about fees, give ranges; say exact amount after a short assessment.
+Ask one question at a time, then wait for the next recording.
 If silence/unclear, ask them to repeat briefly.
 `.trim();
 
@@ -62,53 +91,42 @@ If silence/unclear, ask them to repeat briefly.
       { role: 'user', content: userText },
     ];
 
-    const textModel = process.env.TEXT_MODEL || 'gpt-4o-mini';
-    const cr = await fetch('https://api.openai.com/v1/chat/completions', {
+    const cr = await oaFetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        Authorization: `Bearer ${key}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        model: textModel,
-        temperature: 0.5,
-        messages,
-      }),
+      body: JSON.stringify({ model: TEXT_MODEL, temperature: 0.5, messages }),
     });
+
     const cj = await cr.json();
-    if (!cr.ok) {
-      return res.status(cr.status).json(cj);
-    }
     const reply = (cj.choices?.[0]?.message?.content || '').trim();
 
-    // ---- 3) Text-to-Speech ----
-    const ttsModel = process.env.TTS_MODEL || 'gpt-4o-mini-tts'; // fallback to 'tts-1' if needed
-    const voice = process.env.TTS_VOICE || 'verse';
-
-    const tts = await fetch('https://api.openai.com/v1/audio/speech', {
+    // 3) TTS
+    const tts = await oaFetch('https://api.openai.com/v1/audio/speech', {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        Authorization: `Bearer ${key}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: ttsModel,
-        input: reply,
-        voice,
+        model: TTS_MODEL,
+        input: reply || 'Sorry, I could not process that. Please try again.',
+        voice: TTS_VOICE,
         format: 'mp3',
       }),
     });
-
-    if (!tts.ok) {
-      const err = await tts.json().catch(() => ({}));
-      return res.status(tts.status).json(err);
-    }
 
     const audioBuf = Buffer.from(await tts.arrayBuffer());
     const audioDataUrl = `data:audio/mpeg;base64,${audioBuf.toString('base64')}`;
 
     return res.status(200).json({ ok: true, userText, reply, audio: audioDataUrl });
-  } catch (e) {
-    return res.status(500).json({ error: { message: String(e?.message || e) } });
+  } catch (err) {
+    const status = err?.status || 500;
+    const message =
+      err?.message ||
+      (typeof err === 'string' ? err : 'Unknown server error');
+    return res.status(status).json({ error: { message } });
   }
 }
