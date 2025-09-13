@@ -15,7 +15,8 @@
     h1{margin:0 0 10px}
     .row{display:flex;gap:12px;align-items:center;margin-top:12px;flex-wrap:wrap}
     button{display:inline-flex;gap:8px;align-items:center;justify-content:center;padding:14px 22px;border-radius:999px;border:0;background:#000;color:#fff;font-weight:800;cursor:pointer}
-    #talkBtn{min-width:260px}
+    #talkBtn{min-width:200px}
+    #endBtn{background:#222}
     .led{width:10px;height:10px;border-radius:999px;background:var(--idle);box-shadow:0 0 0 1px #0001}
     .led.on{background:#000}
     #log{font:12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; background:#fafafa; border:1px solid #eee; padding:10px; border-radius:10px; max-height:240px; overflow:auto; margin-top:12px}
@@ -32,7 +33,8 @@
       </label>
 
       <div class="row">
-        <button id="talkBtn">🤖 Greeting…</button>
+        <button id="talkBtn">🎤 Start</button>
+        <button id="endBtn">⏹️ End</button>
         <span class="led" id="led" title="Mic activity"></span>
         <audio id="aiAudio" autoplay playsinline></audio>
       </div>
@@ -43,6 +45,7 @@
 
   <script>
     const talkBtn = document.getElementById('talkBtn');
+    const endBtn  = document.getElementById('endBtn');
     const aiAudio = document.getElementById('aiAudio');
     const led     = document.getElementById('led');
     const consent = document.getElementById('consent');
@@ -51,20 +54,34 @@
     let rec, chunks = [], recording = false, ctx, analyser, dataArray, raf, mediaStream;
     const RMS_THRESHOLD = 0.006, SILENCE_HANG_MS = 1200, MAX_MS = 12000;
     const history = [];
-    let inFlight = false;
-    let greeted = false;
+    let inFlight = false, greeted = false;
 
     function log(...a){ const s=a.map(x=>typeof x==='string'?x:JSON.stringify(x,null,2)).join(' '); logEl.textContent += s+'\n'; logEl.scrollTop = logEl.scrollHeight; }
+
+    function cancelSynth() {
+      try { speechSynthesis.cancel(); } catch {}
+    }
+    function stopAudio() {
+      try { aiAudio.pause(); aiAudio.currentTime = 0; aiAudio.removeAttribute('src'); aiAudio.load(); } catch {}
+    }
+    function resetUI() {
+      talkBtn.disabled = false;
+      talkBtn.textContent = '🎤 Start';
+      led.classList.remove('on');
+    }
 
     talkBtn.addEventListener('click', () => {
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
       if (!greeted) { playGreetingThenListen(); return; }
       if (recording) stopRecording(); else startRecording();
     });
+    endBtn.addEventListener('click', endSession);
+    window.addEventListener('beforeunload', endSession);
 
     // ---- GREETING ----
     async function playGreetingThenListen(){
       if (inFlight) return; inFlight = true;
+      cancelSynth(); stopAudio();
       talkBtn.disabled = true; talkBtn.textContent = '🤖 Greeting…';
       try {
         const r = await fetch('/api/answer', {
@@ -85,7 +102,6 @@
           throw new Error('No audio from server');
         }
       } catch (e) {
-        // Fallback 1: use browser TTS so we ALWAYS speak first
         console.warn('Greeting TTS failed:', e?.message || e);
         alert('Failed to play greeting. You can still talk; I will reply.');
         const fallbackText =
@@ -93,7 +109,6 @@
 Which language would you like — English, Telugu, or Hindi?
 To begin, please tell me the student’s grade and target exam window.`;
         try {
-          // Web Speech API
           const utter = new SpeechSynthesisUtterance(fallbackText);
           utter.rate = 1; utter.pitch = 1; utter.lang = 'en-IN';
           speechSynthesis.speak(utter);
@@ -108,6 +123,7 @@ To begin, please tell me the student’s grade and target exam window.`;
     // ---- RECORDING ----
     async function startRecording(){
       if (recording || inFlight) return;
+      cancelSynth(); stopAudio();
 
       try {
         mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -143,7 +159,7 @@ To begin, please tell me the student’s grade and target exam window.`;
         if (rms > RMS_THRESHOLD) lastLoud = Date.now();
 
         const t = Date.now();
-        if (t - lastLoud > SILENCE_HANG_MS || t - startAt > MAX_MS) { stopRecording(); return; }
+        if (t - lastLoud > 1200 || t - startAt > 12000) { stopRecording(); return; }
         raf = requestAnimationFrame(loop);
       };
       raf = requestAnimationFrame(loop);
@@ -157,7 +173,7 @@ To begin, please tell me the student’s grade and target exam window.`;
       try { if (raf) cancelAnimationFrame(raf); } catch {}
       try { ctx && ctx.close(); } catch {}
       led.classList.remove('on');
-      talkBtn.textContent = '🎙️ Start';
+      talkBtn.textContent = '🎤 Start';
     }
 
     async function onStop(){
@@ -192,7 +208,7 @@ To begin, please tell me the student’s grade and target exam window.`;
           const j = await resp.json();
           if (j.userText) { history.push({ role:'user', content:j.userText }); log('You:', j.userText); }
           if (j.reply)    { history.push({ role:'assistant', content:j.reply }); log('AI:', j.reply); }
-          if (j.audio) { aiAudio.src = j.audio; aiAudio.play().catch(()=>{}); }
+          if (j.audio) { cancelSynth(); aiAudio.src = j.audio; aiAudio.play().catch(()=>{}); }
           ok = true;
         } else {
           let details = {};
@@ -210,7 +226,19 @@ To begin, please tell me the student’s grade and target exam window.`;
         alert('Failed to get answer: ' + (lastError || 'unknown error'));
       }
 
-      inFlight = false; talkBtn.disabled = false; talkBtn.textContent = '🎙️ Start';
+      inFlight = false; talkBtn.disabled = false; talkBtn.textContent = '🎤 Start';
+    }
+
+    // ---- END/RESET ----
+    function endSession() {
+      cancelSynth(); stopAudio();
+      if (recording) stopRecording();
+      try { mediaStream && mediaStream.getTracks().forEach(t=>t.stop()); } catch {}
+      try { ctx && ctx.close(); } catch {}
+      history.length = 0;
+      greeted = false;
+      resetUI();
+      log('— session ended —');
     }
   </script>
 </body>
