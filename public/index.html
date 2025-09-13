@@ -4,235 +4,166 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <meta http-equiv="Cache-Control" content="no-store" />
-  <title>iiTuitions — Voice</title>
+  <title>iiTuitions — Voice (HTTP)</title>
   <style>
     :root{ --ink:#000; --ring:#e5e7eb; --idle:#bbb; }
     *{box-sizing:border-box}
     body{ margin:0; color:var(--ink); font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;
       background:linear-gradient(180deg,#9EC3F2 0%,#DCE7F7 100%); min-height:100vh; }
-    .top{ display:flex;align-items:center;gap:10px; border-bottom:1px solid var(--ring);
-      padding:12px 16px; background:#ffffffcc; backdrop-filter:saturate(120%) blur(6px); }
-    .brand{display:flex;align-items:center;gap:8px;text-decoration:none;color:var(--ink);font-weight:800}
-    .wrap{max-width:980px;margin:28px auto;padding:0 16px}
+    .wrap{max-width:920px;margin:28px auto;padding:0 16px}
     .card{padding:24px;border:1px solid var(--ring);border-radius:16px;box-shadow:0 6px 28px rgba(0,0,0,.06);background:#fff}
     h1{margin:0 0 10px}
     .row{display:flex;gap:12px;align-items:center;margin-top:12px;flex-wrap:wrap}
-    button{display:inline-flex;gap:8px;align-items:center;justify-content:center;padding:12px 16px;border-radius:999px;border:0;
-      background:#000;color:#fff;font-weight:800;cursor:pointer;letter-spacing:.2px}
-    #startBtn{min-width:320px;padding:14px 36px;font-size:18px}
-    button.end{background:#000;color:#fff;border:2px solid #000}
-    button:disabled{opacity:.6;cursor:not-allowed}
-    audio{display:none}
+    button{display:inline-flex;gap:8px;align-items:center;justify-content:center;padding:12px 16px;border-radius:999px;border:0;background:#000;color:#fff;font-weight:800;cursor:pointer}
+    #talkBtn{min-width:260px}
     .led{width:10px;height:10px;border-radius:999px;background:var(--idle);box-shadow:0 0 0 1px #0001}
     .led.on{background:#000}
+    #log{font:12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; background:#fafafa; border:1px solid #eee; padding:10px; border-radius:10px; max-height:200px; overflow:auto}
   </style>
 </head>
 <body>
-  <header class="top">
-    <a class="brand" href="#"><img src="/assets/iituitions-logo.png" alt="logo" style="height:24px"> iiTuitions</a>
-  </header>
-
   <main class="wrap">
     <section class="card">
       <h1>Talk to our Admissions Assistant</h1>
+
       <label style="display:flex;align-items:center;gap:8px;margin-top:10px">
         <input type="checkbox" id="consent" />
         I agree to the recording and storage of this conversation.
       </label>
+
       <div class="row">
-        <button id="startBtn">Start Voice</button>
-        <button id="endBtn" class="end" disabled>End</button>
+        <button id="talkBtn">🎙️ Start talking</button>
         <span class="led" id="led" title="Mic activity"></span>
         <audio id="aiAudio" autoplay playsinline></audio>
       </div>
+
+      <div id="log"></div>
     </section>
   </main>
 
   <script>
-    const startBtn = document.getElementById('startBtn');
-    const endBtn   = document.getElementById('endBtn');
-    const aiAudio  = document.getElementById('aiAudio');
-    const consent  = document.getElementById('consent');
-    const led      = document.getElementById('led');
+    const talkBtn = document.getElementById('talkBtn');
+    const aiAudio = document.getElementById('aiAudio');
+    const led     = document.getElementById('led');
+    const consent = document.getElementById('consent');
+    const logEl   = document.getElementById('log');
 
-    let pc, dc, localStream, remoteStream, silenceRAF, silenceTimer;
-    let callSeq = 0;
+    let rec, chunks = [], recording = false, ctx, analyser, dataArray, raf, mediaStream;
+    const RMS_THRESHOLD = 0.006, SILENCE_HANG_MS = 1200, MAX_MS = 12000;
 
-    const SILENCE_MS = 15000, RMS_THRESHOLD = 0.006;
-    const tod = ()=>{ const h=new Date().getHours(); return h<12?'morning':h<17?'afternoon':h<21?'evening':'night'; };
-    const log = (...a)=>console.log(...a);
+    const history = []; // [{role:'user'|'assistant', content:'...'}]
 
-    async function startCall() {
+    function log(...a){ const s=a.map(x=>typeof x==='string'?x:JSON.stringify(x,null,2)).join(' '); logEl.textContent += s+'\n'; logEl.scrollTop = logEl.scrollHeight; }
+
+    async function startRecording(){
       if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
-      startBtn.disabled = true; endBtn.disabled = false;
-      const mySeq = ++callSeq;
+      if (recording) return;
 
-      // 1) Ephemeral Realtime session (returns ICE)
-      const sessResp = await fetch('/api/session', { cache: 'no-store' });
-      if (!sessResp.ok) {
-        const err = await sessResp.json().catch(()=>({}));
-        alert('Failed to create session' + (err?.error?.message ? (':\n' + err.error.message) : ''));
-        startBtn.disabled=false; endBtn.disabled=true; return;
-      }
-      const sess = await sessResp.json();
-      const EPHEMERAL = sess?.client_secret?.value;
-      const MODEL = encodeURIComponent(sess?.model || 'gpt-4o-realtime-preview');
-      const iceServers = sess?.ice_servers || [{ urls: ['stun:stun.l.google.com:19302'] }];
-
-      // 2) AudioContext
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      if (ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
-      document.body.addEventListener('click', () => { if (ctx.state === 'suspended') ctx.resume(); }, { once:true });
-
-      // 3) RTCPeerConnection
-      pc = new RTCPeerConnection({ iceServers });
-      window.pc = pc;
-      pc.oniceconnectionstatechange = () => log('ice:', pc.iceConnectionState);
-      pc.onconnectionstatechange    = () => log('pc:', pc.connectionState);
-
-      // ---- CRUCIAL: make sure we NEGOTIATE RECEIVE AUDIO ----
-      // Create a transceiver in sendrecv BEFORE createOffer.
-      const audioTx = pc.addTransceiver('audio', { direction: 'sendrecv' });
-
-      // 4) DataChannel for events
-      dc = pc.createDataChannel('oai-events');
-      dc.onmessage = (e) => {
-        try {
-          const msg = JSON.parse(e.data);
-          console.log('OAI:', msg.type || msg);
-
-          // Ask model to speak after user finishes speaking or their item is added
-          if (msg.type === 'input_audio_buffer.speech_stopped' ||
-              (msg.type === 'conversation.item.created' && msg.item?.role === 'user')) {
-            requestResponse();
-          }
-        } catch { console.log('OAI raw:', e.data); }
-      };
-
-      // debounce response.create to avoid duplicate fires
-      let want = false;
-      function requestResponse() {
-        if (!dc || dc.readyState !== 'open') return;
-        if (want) return; want = true;
-        dc.send(JSON.stringify({ type:'response.create', response:{ modalities:['audio','text'] } }));
-        setTimeout(() => want = false, 400);
-      }
-
-      dc.onopen = () => {
-        // Configure session, then greet
-        dc.send(JSON.stringify({
-          type: 'session.update',
-          session: { modalities:['audio','text'], voice:'verse', turn_detection:{ type:'server_vad', silence_duration_ms: 700 } }
-        }));
-        dc.send(JSON.stringify({
-          type: 'response.create',
-          response: { modalities:['audio','text'],
-            instructions:`Hai. Good ${tod()}. May I record this short call for admission support? Which language would you like — English, తెలుగు (Telugu), or हिन्दी (Hindi)?` }
-        }));
-      };
-
-      // 5) Mic → attach to the transceiver sender
       try {
-        localStream = await navigator.mediaDevices.getUserMedia({
+        mediaStream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
         });
       } catch {
-        alert('Microphone blocked. Click Allow and reload.');
-        startBtn.disabled=false; endBtn.disabled=true; return;
+        alert('Microphone blocked. Click Allow and reload.'); return;
       }
-      const mic = localStream.getAudioTracks()[0];
-      await audioTx.sender.replaceTrack(mic);
 
-      // 6) Remote audio
-      pc.ontrack = (ev) => {
-        const stream = ev.streams?.[0] || new MediaStream([ev.track]);
-        if (!remoteStream) remoteStream = stream;
+      // WebAudio for VAD
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      if (ctx.state === 'suspended') await ctx.resume();
+      const src = ctx.createMediaStreamSource(mediaStream);
+      analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
+      dataArray = new Float32Array(analyser.fftSize);
+      src.connect(analyser);
 
-        // a) normal <audio>
-        aiAudio.srcObject = remoteStream;
-        aiAudio.muted = false; aiAudio.volume = 1.0;
-        aiAudio.play().catch(err => console.warn('audio.play failed:', err));
+      // MediaRecorder for audio
+      try {
+        rec = new MediaRecorder(mediaStream, { mimeType:'audio/webm;codecs=opus' });
+      } catch {
+        rec = new MediaRecorder(mediaStream);
+      }
+      chunks = [];
+      rec.ondataavailable = e => { if (e.data.size>0) chunks.push(e.data); };
+      rec.onstop = onStop;
 
-        // b) WebAudio route (guaranteed audible path)
-        try {
-          const remoteNode = ctx.createMediaStreamSource(remoteStream);
-          remoteNode.connect(ctx.destination);
-        } catch (e) { console.warn('WebAudio connect failed:', e); }
+      rec.start(250);
+      recording = true;
+      talkBtn.textContent = '⏹️ Stop (auto when silent)';
+      led.classList.add('on');
+      log('Listening…');
 
-        ev.track.onunmute = () => log('remote track unmuted (audio flowing)');
+      // auto-stop on silence or max duration
+      const startAt = Date.now();
+      let lastLoud = Date.now();
 
-        // LED + silence from mic (optional)
-        const analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
-        const micTap = ctx.createMediaStreamSource(localStream);
-        const dataArray = new Float32Array(analyser.fftSize);
-        micTap.connect(analyser);
+      const loop = () => {
+        if (!recording) return;
+        analyser.getFloatTimeDomainData(dataArray);
+        let rms=0; for (let i=0;i<dataArray.length;i++){ const v=dataArray[i]; rms += v*v; }
+        rms = Math.sqrt(rms / dataArray.length);
+        if (rms > RMS_THRESHOLD) lastLoud = Date.now();
 
-        const resetSilence = () => {
-          if (silenceTimer) clearTimeout(silenceTimer);
-          silenceTimer = setTimeout(() => {
-            try {
-              dc?.send(JSON.stringify({
-                type:'response.create',
-                response:{ modalities:['audio','text'], instructions:"Sorry, I'm unable to hear you. I'll end this call now." }
-              }));
-            } catch {}
-          }, SILENCE_MS);
-        };
-
-        const monitor = () => {
-          analyser.getFloatTimeDomainData(dataArray);
-          let rms = 0; for (let i=0;i<dataArray.length;i++){ const v=dataArray[i]; rms += v*v; }
-          rms = Math.sqrt(rms / dataArray.length);
-          if (rms > RMS_THRESHOLD) { led.classList.add('on'); resetSilence(); }
-          else { led.classList.remove('on'); }
-          silenceRAF = requestAnimationFrame(monitor);
-        };
-        setTimeout(()=>{ resetSilence(); monitor(); }, 800);
+        const t = Date.now();
+        if (t - lastLoud > SILENCE_HANG_MS || t - startAt > MAX_MS) {
+          stopRecording(); return;
+        }
+        raf = requestAnimationFrame(loop);
       };
+      raf = requestAnimationFrame(loop);
+    }
 
-      // 7) Offer/Answer
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      await new Promise((resolve) => {
-        if (pc.iceGatheringState === 'complete') return resolve();
-        pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') resolve(); };
-        setTimeout(resolve, 1200);
+    function stopRecording(){
+      if (!recording) return;
+      recording = false;
+      try { rec.stop(); } catch {}
+      try { mediaStream.getTracks().forEach(t=>t.stop()); } catch {}
+      try { if (raf) cancelAnimationFrame(raf); } catch {}
+      try { ctx && ctx.close(); } catch {}
+      led.classList.remove('on');
+      talkBtn.textContent = '🎙️ Start talking';
+    }
+
+    async function onStop(){
+      const blob = new Blob(chunks, { type:'audio/webm' });
+      const b64 = await blobToDataURL(blob); // data:audio/webm;base64,....
+      await sendToServer(b64);
+    }
+
+    function blobToDataURL(blob){
+      return new Promise((res, rej) => {
+        const reader = new FileReader();
+        reader.onloadend = () => res(reader.result);
+        reader.onerror = rej;
+        reader.readAsDataURL(blob);
       });
+    }
 
-      const sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${MODEL}`, {
+    async function sendToServer(dataUrl){
+      log('Sending audio…');
+      const resp = await fetch('/api/answer', {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${EPHEMERAL}`,
-          'Content-Type': 'application/sdp',
-          'OpenAI-Beta': 'realtime=v1'
-        },
-        body: pc.localDescription.sdp
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ audio: dataUrl, history }),
       });
-
-      if (!sdpResp.ok) {
-        console.error('Realtime SDP error:', await sdpResp.text());
-        alert('Realtime connection failed (model/quota/key).');
-        endCall(); return;
+      const j = await resp.json().catch(()=>({}));
+      if (!resp.ok) {
+        console.error('Answer error:', j);
+        alert('Failed to get answer'); return;
       }
 
-      const sdpText = await sdpResp.text();
-      if (mySeq !== callSeq) return;
-      if (pc.signalingState === 'have-local-offer') {
-        await pc.setRemoteDescription({ type: 'answer', sdp: sdpText });
+      const { userText, reply, audio } = j;
+      if (userText) { history.push({ role:'user', content:userText }); log('You:', userText); }
+      if (reply)    { history.push({ role:'assistant', content:reply }); log('AI:', reply); }
+
+      if (audio) {
+        aiAudio.src = audio;
+        aiAudio.play().catch(err => console.warn('play failed:', err));
       }
     }
 
-    async function endCall() {
-      endBtn.disabled = true; callSeq++;
-      try { if (silenceTimer) clearTimeout(silenceTimer); if (silenceRAF) cancelAnimationFrame(silenceRAF); } catch {}
-      try { pc && pc.close(); } catch {}
-      try { localStream && localStream.getTracks().forEach(t => t.stop()); } catch {}
-      startBtn.disabled = false; led.classList.remove('on');
-    }
-
-    startBtn.addEventListener('click', startCall);
-    endBtn.addEventListener('click', endCall);
-    window.addEventListener('beforeunload', () => { try { pc && pc.close(); } catch {} });
+    talkBtn.addEventListener('click', () => {
+      if (recording) stopRecording();
+      else startRecording();
+    });
   </script>
 </body>
 </html>
