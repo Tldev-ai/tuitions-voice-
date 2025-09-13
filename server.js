@@ -1,8 +1,8 @@
 // server.js
-// Node 18+ (global fetch). Run with:  node server.js
-// Env required: OPENAI_API_KEY
+// Node 18+ (global fetch). Run with: node server.js
+// Required: OPENAI_API_KEY
 // Optional: REALTIME_MODEL, REALTIME_VOICE
-// Optional TURN (recommended on NAT/Wi-Fi): TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
+// Optional TURN: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
 // Optional Drive upload: GOOGLE_SERVICE_ACCOUNT_JSON, DRIVE_FOLDER_ID
 
 import 'dotenv/config';
@@ -14,18 +14,18 @@ import { fileURLToPath } from 'url';
 import { Readable } from 'stream';
 import { google } from 'googleapis';
 
-// ---------- App & middleware ----------
+// ---------- App ----------
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// serve static site from ./public
+// Static site from ./public
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 app.use(express.static(path.join(__dirname, 'public')));
 
-// uploads held in memory (we stream them to Drive)
+// Uploads in memory
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
@@ -37,7 +37,7 @@ let drive = null;
   try {
     const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
     if (!raw) {
-      console.log('Drive: no GOOGLE_SERVICE_ACCOUNT_JSON set (upload endpoint will 501).');
+      console.log('Drive: GOOGLE_SERVICE_ACCOUNT_JSON not set (upload endpoint will 501).');
       return;
     }
     const creds = JSON.parse(raw);
@@ -58,12 +58,12 @@ let drive = null;
 
 // ---------- Helpers ----------
 async function getIceServers() {
-  // Default STUN always present
+  // Default STUN
   let iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
 
   const sid = process.env.TWILIO_ACCOUNT_SID;
   const tok = process.env.TWILIO_AUTH_TOKEN;
-  if (!sid || !tok) return iceServers; // TURN not configured
+  if (!sid || !tok) return iceServers;
 
   try {
     const r = await fetch(
@@ -128,9 +128,11 @@ async function sessionHandler(_req, res) {
     if (!OPENAI_API_KEY) {
       return res.status(500).json({ error: { message: 'OPENAI_API_KEY is not set' } });
     }
+
     const model = process.env.REALTIME_MODEL || 'gpt-4o-realtime-preview';
     const voice = process.env.REALTIME_VOICE || 'verse';
 
+    // NOTE: No create_response / interrupt_response here.
     const oa = await fetch('https://api.openai.com/v1/realtime/sessions', {
       method: 'POST',
       headers: {
@@ -142,8 +144,6 @@ async function sessionHandler(_req, res) {
         model,
         voice,
         modalities: ['audio', 'text'],
-        create_response: true,               // let server auto-reply each turn
-        interrupt_response: true,
         turn_detection: { type: 'server_vad', silence_duration_ms: 700 },
         instructions: buildInstructions(),
       }),
@@ -156,7 +156,6 @@ async function sessionHandler(_req, res) {
     }
 
     const iceServers = await getIceServers();
-    // Return OpenAI session JSON plus ICE servers for the browser peerconnection
     return res.status(200).json({ ...oaJson, ice_servers: iceServers });
   } catch (e) {
     console.error('Failed to create realtime session:', e?.message || e);
@@ -164,20 +163,15 @@ async function sessionHandler(_req, res) {
   }
 }
 
-// Mount on both paths (client might call either)
 app.get('/api/session', sessionHandler);
 app.get('/session', sessionHandler);
 
-// ---------- Upload audio + transcript to Google Drive ----------
+// ---------- Upload to Google Drive (optional) ----------
 async function uploadHandler(req, res) {
   try {
-    if (!drive) {
-      return res.status(501).json({ error: 'Drive not configured' });
-    }
+    if (!drive) return res.status(501).json({ error: 'Drive not configured' });
     const folderId = process.env.DRIVE_FOLDER_ID;
-    if (!folderId) {
-      return res.status(501).json({ error: 'DRIVE_FOLDER_ID not set' });
-    }
+    if (!folderId) return res.status(501).json({ error: 'DRIVE_FOLDER_ID not set' });
 
     const { transcriptJson } = req.body;
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
@@ -213,13 +207,13 @@ async function uploadHandler(req, res) {
 }
 
 app.post('/api/upload', upload.single('audio'), uploadHandler);
-app.post('/upload', upload.single('audio'), uploadHandler); // alias
+app.post('/upload', upload.single('audio'), uploadHandler);
 
-// ---------- Start server ----------
+// ---------- Start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\nServer running on http://localhost:${PORT}`);
-  console.log(`Static site → http://localhost:${PORT}/`);
-  console.log(`Session API → GET /api/session`);
-  console.log(`Upload API  → POST /api/upload`);
+  console.log(`Static site  → http://localhost:${PORT}/`);
+  console.log(`Session API  → GET /api/session`);
+  console.log(`Upload  API  → POST /api/upload`);
 });
