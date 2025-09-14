@@ -1,6 +1,5 @@
-// /api/session.js  (Vercel/Node)
-// Creates a short-lived OpenAI Realtime session and returns the client_secret.
-// Optional: also returns ICE/TURN servers built from env for your RTCPeerConnection.
+// api/session.js
+import 'dotenv/config';
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') {
@@ -9,99 +8,50 @@ export default async function handler(req, res) {
   }
 
   try {
-    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ error: 'Missing OPENAI_API_KEY' });
-    }
+    // --- Admissions call script (short, structured) ---
+    const INSTRUCTIONS = `
+You are "iiTuitions Admissions Assistant". Speak warmly, concise, and natural on a phone call.
+Language: Start in the caller’s language. Offer English / తెలుగు / हिन्दी once, then continue in their choice.
+Turn-taking: Ask one question, wait for answer. Keep replies ~1–2 sentences to keep the call flowing.
+If silent for ~10s, say you can’t hear them and end politely.
 
-    // Optional TURN support from env
-    const iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
-    if (process.env.TURN_URLS && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
-      const list = process.env.TURN_URLS.split(',').map(s => s.trim()).filter(Boolean);
-      for (const url of list) {
-        iceServers.push({
-          urls: url,
-          username: process.env.TURN_USERNAME,
-          credential: process.env.TURN_CREDENTIAL
-        });
-      }
-    }
+Call flow:
+1) Greet + language choice.
+2) Relation to student, student name, grade+board (CBSE/ICSE/State), subjects needed.
+3) Location (area/city) or Online preference.
+4) Schedule: days & time windows for classes and demo.
+5) Brief assessment pitch: 45–60 min sample-teach (not an exam) → we share: (a) level snapshot, (b) plan, (c) fee quote.
+6) Pricing policy (high level only on call): hourly; personalized quote after assessment. Mention hour packs (20/40/60/100) with up to ~20% savings if they ask.
+7) Guarantees (brief): clarity guarantee, easy teacher switch, progress check-ins.
+8) Close: Confirm summary + preferred callback time. If they want a demo, propose a slot and confirm.
 
-    // === Admissions calling script (condensed & structured) ===
-    const script = `
-You are "iiTuitions Admissions Assistant". Speak warmly, concise, and confident.
-
-LANGUAGE:
-- Start with: "Hai. Good <time-of-day>."
-- Ask: "Which language would you like—English, తెలుగు (Telugu), or हिन्दी (Hindi)?"
-- Detect and continue only in that language for the rest of the call.
-
-TURN-TAKING:
-- Ask ONE question, wait for the parent, then continue. Keep answers short unless asked.
-
-90-SECOND TRIAGE (ask one-by-one):
-1) Student's grade and board, and exam window?
-2) Current school/coaching and weekly tests?
-3) Biggest frustration in last 30 days?
-4) Subject split—what feels conceptual vs numerical (PCM)?
-5) Pace & stress (international syllabus → faster pace?) 
-6) Discipline & doubts—how quickly are doubts cleared?
-
-TAG (internal, DO NOT SAY):
-Pick up to 3 issue tags: [Pace][Batch][International][Lost11][Panic][Num-Phy][Num-Che][Num-Math][Concept-X][Discipline][Doubts][Board][Dropper][Second-Opinion][Cost].
-
-POSITIONING (short 1–2 lines):
-- 100% 1-on-1 mentorship by IIT/NIT alumni.
-- Precision assessments → personal roadmap, daily WhatsApp updates, corrections every 15 days, recorded sessions, and a triple guarantee.
-- Limited intake: 50 students/year.
-
-NEXT STEP:
-Offer a free assessment + demo, then collect:
-- Student name, grade/board, subjects
-- Location or online preference
-- Parent phone + email
-- Preferred time to call back
-
-PRICING POLICY:
-- Before assessment: share only a per-hour evaluation range **if asked**.
-- Monthly plans only after assessment.
-
-SILENCE & CLOSE:
-- If no reply for ~10s, say you can't hear and end politely.
-- Recap decisions and confirm follow-up time. End with a friendly sign-off.
-
-Never defame other institutes. Be truthful about capacities.
+Always mirror parent’s concerns (fees, offline vs online, teacher quality), and keep it friendly and efficient.
     `.trim();
-
-    const model = process.env.REALTIME_MODEL || 'gpt-4o-realtime-preview';
 
     const r = await fetch('https://api.openai.com/v1/realtime/sessions', {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
         'Content-Type': 'application/json',
         'OpenAI-Beta': 'realtime=v1'
       },
       body: JSON.stringify({
-        model,
-        // The model will speak – client also asks for audio
+        model: process.env.REALTIME_MODEL || 'gpt-4o-realtime-preview',
+        // Force audio every turn
+        modalities: ['audio', 'text'],
         voice: process.env.REALTIME_VOICE || 'verse',
-        // Let the model auto-reply when you finish speaking:
-        turn_detection: { type: 'server_vad', silence_duration_ms: 700 },
-        instructions: script
-      })
+        // Server VAD = the model listens and replies automatically turn-by-turn
+        turn_detection: { type: 'server_vad', silence_duration_ms: 800 },
+        instructions: INSTRUCTIONS,
+      }),
     });
 
     const data = await r.json();
     if (!r.ok) {
       return res.status(r.status).json(data);
     }
-
-    // Add ICE for the client to use when creating RTCPeerConnection
-    data.iceServers = iceServers;
-
-    res.status(200).json(data);
+    res.json(data);
   } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
+    res.status(500).json({ error: { message: String(e?.message || e) } });
   }
 }
