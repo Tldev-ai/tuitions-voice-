@@ -3,205 +3,157 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>iiTuitions — Voice</title>
+<title>iiTuitions — Voice (HTTPS loop)</title>
 <style>
-  body{margin:0;font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;background:linear-gradient(180deg,#9EC3F2 0%,#DCE7F7 100%);min-height:100vh;color:#111}
+  body{margin:0;background:linear-gradient(180deg,#9EC3F2 0%,#DCE7F7 100%);font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;color:#111;min-height:100vh}
   .wrap{max-width:980px;margin:32px auto;padding:0 16px}
   .card{background:#fff;border:1px solid #e6e6e6;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.06);padding:22px}
-  h1{margin:0 0 8px}
-  .row{display:flex;gap:12px;align-items:center;margin:14px 0}
+  h1{margin:0 0 12px}
+  .row{display:flex;align-items:center;gap:12px;margin:14px 0;flex-wrap:wrap}
   button{border:0;border-radius:999px;background:#000;color:#fff;font-weight:800;padding:14px 22px;cursor:pointer}
   button:disabled{opacity:.55;cursor:not-allowed}
-  .led{width:10px;height:10px;border-radius:999px;background:#cfcfcf}
+  .led{width:12px;height:12px;border-radius:999px;background:#cfcfcf}
   .on{background:#0a0}
   pre{background:#f7f7f8;border:1px solid #eee;border-radius:12px;padding:12px;max-height:40vh;overflow:auto}
   audio{display:none}
 </style>
 </head>
 <body>
-  <main class="wrap">
-    <section class="card">
-      <h1>Talk to our Admissions Assistant</h1>
-
-      <label><input type="checkbox" id="consent" checked/> I agree to the recording and storage of this conversation.</label>
-
-      <div class="row">
-        <button id="startBtn">Start</button>
-        <button id="endBtn" disabled>End</button>
-        <span id="led" class="led" title="Mic activity"></span>
-        <audio id="aiAudio" autoplay playsinline></audio>
-      </div>
-
-      <div>On call. Speak normally. The assistant will reply.</div>
-      <pre id="log"></pre>
-    </section>
-  </main>
+<main class="wrap">
+  <section class="card">
+    <h1>Talk to our Admissions Assistant</h1>
+    <label><input type="checkbox" id="consent" checked/> I agree to the recording and storage of this conversation.</label>
+    <div class="row">
+      <button id="startBtn">Start / Talk</button>
+      <button id="stopBtn" disabled>Stop</button>
+      <span id="led" class="led" title="Mic"></span>
+      <audio id="tts" autoplay playsinline></audio>
+    </div>
+    <div><b>Status:</b> <span id="status">Idle</span></div>
+    <div class="row" style="margin-top:10px"><b>Transcript:</b> <span id="asr"></span></div>
+    <div class="row" style="margin-top:10px"><b>Assistant:</b> <span id="assistant"></span></div>
+    <pre id="log"></pre>
+  </section>
+</main>
 
 <script>
-const startBtn = document.getElementById('startBtn');
-const endBtn   = document.getElementById('endBtn');
-const led      = document.getElementById('led');
-const logEl    = document.getElementById('log');
-const aiAudio  = document.getElementById('aiAudio');
-const consent  = document.getElementById('consent');
+const consent = document.getElementById('consent');
+const startBtn= document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const tts     = document.getElementById('tts');
+const led     = document.getElementById('led');
+const asrEl   = document.getElementById('asr');
+const botEl   = document.getElementById('assistant');
+const statusEl= document.getElementById('status');
+const logEl   = document.getElementById('log');
+const log = (m)=>{ logEl.textContent += (typeof m==='string'?m:JSON.stringify(m))+"\n"; logEl.scrollTop=logEl.scrollHeight; };
 
-const log = (m)=>{ logEl.textContent += (typeof m==='string'?m:JSON.stringify(m)) + '\n'; logEl.scrollTop = logEl.scrollHeight; };
+let media, rec, chunks=[], ctx, analyser, buf, raf;
+let history = []; // text turns [{role:'user'|'assistant', content:'...'}]
 
-let pc, dc, micStream, silTimer;
+const SILENCE_MS = 1200;
+const RMS_ON  = 0.007;
+const RMS_OFF = 0.004;
 
-const SILENCE_MS = 12000;
-
-function resetSilence() {
-  clearTimeout(silTimer);
-  silTimer = setTimeout(()=> {
-    try {
-      dc?.send(JSON.stringify({
-        type: 'response.create',
-        response: {
-          modalities: ['audio','text'],
-          instructions: "Sorry, I'm unable to hear you. I'll end this call now."
-        }
-      }));
-    } catch {}
-  }, SILENCE_MS);
+function pickMime(){
+  if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) return 'audio/webm;codecs=opus';
+  if (MediaRecorder.isTypeSupported('audio/webm')) return 'audio/webm';
+  if (MediaRecorder.isTypeSupported('audio/mp4')) return 'audio/mp4'; // Safari
+  return '';
 }
 
-async function startCall(){
-  if (!consent.checked) { alert('Please provide consent to proceed.'); return; }
-  startBtn.disabled = true; endBtn.disabled = false;
+async function startRec(){
+  if (!consent.checked) { alert('Please provide consent.'); return; }
+  startBtn.disabled = true; stopBtn.disabled = false; statusEl.textContent = 'Listening…';
 
-  // 1) Get ephemeral session descriptor (client_secret)
-  const s = await fetch('/api/session');
-  if (!s.ok) {
-    const t = await s.text().catch(()=> '');
-    alert('Failed to create session:\n' + t);
-    startBtn.disabled=false; endBtn.disabled=true; return;
-  }
-  const sess = await s.json();
-  const EPHEMERAL = sess?.client_secret?.value;
-  const MODEL = encodeURIComponent(sess?.model || 'gpt-4o-realtime-preview');
+  const mime = pickMime();
+  media = await navigator.mediaDevices.getUserMedia({ audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true} });
 
-  // 2) Create PeerConnection (TURN optional via env if you add it)
-  pc = new RTCPeerConnection({
-    iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
-  });
+  // LED + VAD
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
+  ctx.createMediaStreamSource(media).connect(analyser);
+  buf = new Float32Array(analyser.fftSize);
+  let speaking=false, lastSound=Date.now();
 
-  pc.oniceconnectionstatechange = ()=> log('ice: ' + pc.iceConnectionState);
-  pc.onconnectionstatechange = ()=> log('pc: ' + pc.connectionState);
-
-  // MUST declare a transceiver to receive model audio
-  pc.addTransceiver('audio', { direction: 'sendrecv' });
-
-  // 3) DataChannel to control session
-  dc = pc.createDataChannel('oai-events');
-  dc.onopen = () => {
-    log('Realtime started…');
-    // Important: modalities MUST include both 'audio' and 'text'
-    dc.send(JSON.stringify({
-      type: 'session.update',
-      session: {
-        voice: 'verse',
-        modalities: ['audio','text'],
-        turn_detection: { type: 'server_vad', silence_duration_ms: 550 }
-      }
-    }));
-
-    // First greeting (audio+text)
-    dc.send(JSON.stringify({
-      type: 'response.create',
-      response: {
-        modalities: ['audio','text'],
-        instructions: "Hi! Which language would you like — English, Telugu, or Hindi?"
-      }
-    }));
-  };
-  dc.onmessage = (e)=>{
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg.type?.includes('error') || msg.level === 'error') {
-        log('OAI error: ' + JSON.stringify(msg));
-      } else {
-        log('OAI: ' + msg.type);
-      }
-    } catch { log('OAI: ' + e.data); }
-  };
-
-  // 4) Attach remote audio straight to <audio> (no mixing)
-  pc.ontrack = (ev)=>{
-    log('remote track seen');
-    const remoteStream = ev.streams[0];
-    aiAudio.srcObject = remoteStream;
-    aiAudio.muted = false;
-    aiAudio.play().catch(()=>{});
-    ev.track.onunmute = ()=> { log('remote track unmuted (audio flowing)'); };
-  };
-
-  // 5) Get microphone and publish
-  try {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true} });
-  } catch (err) {
-    alert('Microphone blocked. Allow mic and reload.'); 
-    startBtn.disabled=false; endBtn.disabled=true; 
-    return;
-  }
-  micStream.getTracks().forEach(t=> pc.addTrack(t, micStream));
-
-  // 6) Create SDP offer, wait for gather, POST to Realtime
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  await new Promise((r)=>{
-    if (pc.iceGatheringState === 'complete') return r();
-    pc.onicegatheringstatechange = ()=> { if (pc.iceGatheringState === 'complete') r(); };
-    setTimeout(r, 1200);
-  });
-
-  const rt = await fetch(`https://api.openai.com/v1/realtime?model=${MODEL}`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${EPHEMERAL}`,
-      'Content-Type': 'application/sdp',
-      'OpenAI-Beta': 'realtime=v1',
-    },
-    body: pc.localDescription.sdp
-  });
-
-  if (!rt.ok) {
-    const t = await rt.text();
-    console.error('SDP error', t);
-    alert('Realtime start failed.\n' + t);
-    endCall();
-    return;
-  }
-
-  const answer = { type: 'answer', sdp: await rt.text() };
-  await pc.setRemoteDescription(answer);
-
-  // 7) Simple mic-LED + silence timer
-  const ctx = new (window.AudioContext || window.webkitAudioContext)();
-  const analyser = ctx.createAnalyser();
-  analyser.fftSize = 2048;
-  ctx.createMediaStreamSource(micStream).connect(analyser);
-  const buf = new Float32Array(analyser.fftSize);
-
-  (function monitor(){
+  (function pulse(){
     analyser.getFloatTimeDomainData(buf);
-    let rms=0; for (let i=0;i<buf.length;i++){ rms += buf[i]*buf[i]; }
+    let rms=0; for (let i=0;i<buf.length;i++){ rms+=buf[i]*buf[i]; }
     rms = Math.sqrt(rms/buf.length);
-    if (rms > 0.006){ led.classList.add('on'); resetSilence(); } else { led.classList.remove('on'); }
-    requestAnimationFrame(monitor);
+    const active = rms > (speaking? RMS_OFF : RMS_ON);
+    if (active){ led.classList.add('on'); lastSound = Date.now(); speaking=true; }
+    else { led.classList.remove('on'); }
+    if (speaking && Date.now() - lastSound > SILENCE_MS) { stopRec(); return; }
+    raf = requestAnimationFrame(pulse);
   })();
+
+  // Recorder
+  rec = new MediaRecorder(media, mime ? { mimeType: mime } : undefined);
+  chunks = [];
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = async ()=>{
+    try {
+      const blob = new Blob(chunks, { type: mime || 'audio/webm' });
+      const b64 = await blobToBase64(blob);
+      await sendToServer(b64, (mime||'audio/webm'));
+    } catch (e){ log(e); }
+    finally { startBtn.disabled=false; stopBtn.disabled=true; statusEl.textContent='Idle'; }
+  };
+  rec.start(250);
 }
 
-async function endCall(){
-  endBtn.disabled = true;
-  clearTimeout(silTimer);
-  try { pc && pc.close(); } catch {}
-  try { micStream && micStream.getTracks().forEach(t=>t.stop()); } catch {}
-  startBtn.disabled = false;
+function stopRec(){
+  try { cancelAnimationFrame(raf); } catch {}
+  try { rec && rec.state !== 'inactive' && rec.stop(); } catch {}
+  try { media && media.getTracks().forEach(t=>t.stop()); } catch {}
+  stopBtn.disabled = true;
+  statusEl.textContent = 'Thinking…';
 }
 
-startBtn.addEventListener('click', startCall);
-endBtn.addEventListener('click', endCall);
+function blobToBase64(blob){
+  return new Promise((resolve, reject)=>{
+    const r = new FileReader();
+    r.onload = ()=> resolve((r.result+'').split(',')[1]);
+    r.onerror = reject;
+    r.readAsDataURL(blob);
+  });
+}
+
+async function sendToServer(audioBase64, mime){
+  try{
+    const r = await fetch('/api/answer', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ audioBase64, mime, history })
+    });
+    if (!r.ok){
+      const t = await r.text(); log('Answer error: ' + t);
+      alert('Failed to get answer');
+      return;
+    }
+    const j = await r.json();
+    asrEl.textContent = j.transcript || '';
+    botEl.textContent = j.reply || '';
+
+    // keep text history short
+    if (j.transcript) history.push({ role:'user', content:j.transcript });
+    if (j.reply)      history.push({ role:'assistant', content:j.reply });
+    if (history.length > 12) history = history.slice(-12);
+
+    // play MP3
+    if (j?.audio?.data){
+      const src = 'data:audio/mp3;base64,' + j.audio.data;
+      tts.src = src;
+      await tts.play().catch(()=>{});
+    }
+  }catch(err){
+    log(err);
+    alert('Network/Server error');
+  }
+}
+
+startBtn.addEventListener('click', startRec);
+stopBtn.addEventListener('click', stopRec);
 </script>
 </body>
 </html>
