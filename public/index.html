@@ -141,7 +141,7 @@ Call flow:
         dc.send(JSON.stringify({
           type: 'response.create',
           response: {
-            modalities: ['audio'],
+            modalities: ['text','audio'],
             instructions: `Hai. Good ${timeOfDay()}. Which language would you like to talk in — English, తెలుగు (Telugu), or हिन्दी (Hindi)?`
           }
         }));
