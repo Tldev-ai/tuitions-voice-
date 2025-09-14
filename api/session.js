@@ -1,31 +1,25 @@
-// api/session.js
-import 'dotenv/config';
-
+// /api/session.js  — Vercel serverless (Node runtime)
 export default async function handler(req, res) {
   if (req.method !== 'GET') {
     res.status(405).json({ error: 'Method not allowed' });
     return;
   }
 
+  // --- hard guard: env must exist
+  if (!process.env.OPENAI_API_KEY) {
+    res.status(500).json({ error: 'OPENAI_API_KEY is not set in Vercel Project → Settings → Environment Variables' });
+    return;
+  }
+
   try {
-    // --- Admissions call script (short, structured) ---
     const INSTRUCTIONS = `
-You are "iiTuitions Admissions Assistant". Speak warmly, concise, and natural on a phone call.
-Language: Start in the caller’s language. Offer English / తెలుగు / हिन्दी once, then continue in their choice.
-Turn-taking: Ask one question, wait for answer. Keep replies ~1–2 sentences to keep the call flowing.
-If silent for ~10s, say you can’t hear them and end politely.
-
-Call flow:
-1) Greet + language choice.
-2) Relation to student, student name, grade+board (CBSE/ICSE/State), subjects needed.
-3) Location (area/city) or Online preference.
-4) Schedule: days & time windows for classes and demo.
-5) Brief assessment pitch: 45–60 min sample-teach (not an exam) → we share: (a) level snapshot, (b) plan, (c) fee quote.
-6) Pricing policy (high level only on call): hourly; personalized quote after assessment. Mention hour packs (20/40/60/100) with up to ~20% savings if they ask.
-7) Guarantees (brief): clarity guarantee, easy teacher switch, progress check-ins.
-8) Close: Confirm summary + preferred callback time. If they want a demo, propose a slot and confirm.
-
-Always mirror parent’s concerns (fees, offline vs online, teacher quality), and keep it friendly and efficient.
+You are "iiTuitions Admissions Assistant". Speak warmly and naturally.
+Language: Offer English / తెలుగు / हिन्दी once; continue in their choice.
+Turn-taking: ask one question, wait for reply. Short 1–2 sentence turns.
+If silent ~10s: say you can’t hear them and end politely.
+Flow: greeting+language → relation/name/grade+board → subjects → location/Online →
+schedule & demo → short assessment pitch → pricing policy (high-level)
+→ guarantees → confirm summary & callback/demo time.
     `.trim();
 
     const r = await fetch('https://api.openai.com/v1/realtime/sessions', {
@@ -33,25 +27,30 @@ Always mirror parent’s concerns (fees, offline vs online, teacher quality), an
       headers: {
         Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
         'Content-Type': 'application/json',
-        'OpenAI-Beta': 'realtime=v1'
+        'OpenAI-Beta': 'realtime=v1',
       },
       body: JSON.stringify({
         model: process.env.REALTIME_MODEL || 'gpt-4o-realtime-preview',
-        // Force audio every turn
         modalities: ['audio', 'text'],
         voice: process.env.REALTIME_VOICE || 'verse',
-        // Server VAD = the model listens and replies automatically turn-by-turn
         turn_detection: { type: 'server_vad', silence_duration_ms: 800 },
         instructions: INSTRUCTIONS,
       }),
     });
 
-    const data = await r.json();
+    // capture raw text for clearer errors
+    const raw = await r.text();
     if (!r.ok) {
-      return res.status(r.status).json(data);
+      let parsed;
+      try { parsed = JSON.parse(raw); } catch { parsed = { raw }; }
+      res.status(r.status).json(parsed);
+      return;
     }
-    res.json(data);
+
+    const data = JSON.parse(raw);
+    res.status(200).json(data);
   } catch (e) {
-    res.status(500).json({ error: { message: String(e?.message || e) } });
+    console.error('SESSION ROUTE CRASH:', e);
+    res.status(500).json({ error: 'Server crashed in /api/session', details: String(e?.message || e) });
   }
 }
