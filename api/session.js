@@ -1,56 +1,60 @@
-// /api/session.js  — Vercel serverless (Node runtime)
-export default async function handler(req, res) {
-  if (req.method !== 'GET') {
-    res.status(405).json({ error: 'Method not allowed' });
-    return;
-  }
+// /api/session.js
+export const config = { runtime: 'nodejs' };
 
-  // --- hard guard: env must exist
-  if (!process.env.OPENAI_API_KEY) {
-    res.status(500).json({ error: 'OPENAI_API_KEY is not set in Vercel Project → Settings → Environment Variables' });
-    return;
-  }
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
+// Minimal, **valid** payload for the sessions API.
+// Do NOT include unknown fields like "create_response" (that causes "Unknown parameter" errors).
+const SYSTEM_INSTRUCTIONS = `
+You are "iiTuitions Admissions Assistant". Speak warmly.
+Follow this call flow strictly and be concise:
+
+1) Greet: "Hai." + "Good <time-of-day>." Then ask:
+   "Which language would you like to talk in — English, తెలుగు (Telugu), or हिन्दी (Hindi)?"
+2) One question at a time. Collect:
+   - Student name
+   - Grade/board
+   - Subjects
+   - Online or home-tuition preference and location (if home)
+   - Preferred time to call back
+   - Budget range (optional)
+3) Offer info: course/batch options & fees range; offer a demo time.
+4) If silent ~10s, say you can't hear and will end soon.
+5) Close politely.
+
+Always switch to the caller's chosen language.
+`;
+
+export default async function handler(_req, res) {
   try {
-    const INSTRUCTIONS = `
-You are "iiTuitions Admissions Assistant". Speak warmly and naturally.
-Language: Offer English / తెలుగు / हिन्दी once; continue in their choice.
-Turn-taking: ask one question, wait for reply. Short 1–2 sentence turns.
-If silent ~10s: say you can’t hear them and end politely.
-Flow: greeting+language → relation/name/grade+board → subjects → location/Online →
-schedule & demo → short assessment pitch → pricing policy (high-level)
-→ guarantees → confirm summary & callback/demo time.
-    `.trim();
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ error: 'Missing OPENAI_API_KEY' });
+    }
 
     const r = await fetch('https://api.openai.com/v1/realtime/sessions', {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
         'Content-Type': 'application/json',
-        'OpenAI-Beta': 'realtime=v1',
       },
       body: JSON.stringify({
         model: process.env.REALTIME_MODEL || 'gpt-4o-realtime-preview',
-        modalities: ['audio', 'text'],
         voice: process.env.REALTIME_VOICE || 'verse',
-        turn_detection: { type: 'server_vad', silence_duration_ms: 800 },
-        instructions: INSTRUCTIONS,
+        modalities: ['audio','text'],
+        instructions: SYSTEM_INSTRUCTIONS,
+        // Helpful defaults:
+        turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 500 },
+        // Let the model actually produce audio:
+        output_audio_format: 'pcm16',
       }),
     });
 
-    // capture raw text for clearer errors
-    const raw = await r.text();
+    const data = await r.json();
     if (!r.ok) {
-      let parsed;
-      try { parsed = JSON.parse(raw); } catch { parsed = { raw }; }
-      res.status(r.status).json(parsed);
-      return;
+      return res.status(r.status).json(data);
     }
-
-    const data = JSON.parse(raw);
     res.status(200).json(data);
   } catch (e) {
-    console.error('SESSION ROUTE CRASH:', e);
-    res.status(500).json({ error: 'Server crashed in /api/session', details: String(e?.message || e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 }
